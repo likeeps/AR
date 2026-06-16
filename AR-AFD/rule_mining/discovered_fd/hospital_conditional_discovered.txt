@@ -1,0 +1,51 @@
+City->CountyName
+City,CountyName->State
+City,HospitalName->CountyName
+City,HospitalName->State
+CountyName,HospitalName->State
+HospitalName->City
+HospitalName->CountyName
+HospitalName->EmergencyService
+HospitalName->HospitalOwner
+HospitalName->HospitalType
+HospitalName->PhoneNumber
+HospitalName->ProviderNumber
+HospitalName->State
+HospitalName->ZIPCode
+HospitalName,ZIPCode->HospitalOwner
+HospitalName,ZIPCode->HospitalType
+MeasureCode->Condition
+MeasureCode->MeasureName
+MeasureName->Condition
+MeasureName->MeasureCode
+PhoneNumber->City
+PhoneNumber->CountyName
+PhoneNumber->EmergencyService
+PhoneNumber->HospitalName
+PhoneNumber->HospitalOwner
+PhoneNumber->HospitalType
+PhoneNumber->State
+PhoneNumber->ZIPCode
+ProviderNumber->City
+ProviderNumber->CountyName
+ProviderNumber->EmergencyService
+ProviderNumber->HospitalName
+ProviderNumber->HospitalOwner
+ProviderNumber->HospitalType
+ProviderNumber->State
+ProviderNumber->ZIPCode
+StateAvg->Condition
+StateAvg->MeasureCode
+StateAvg->MeasureName
+StateAvg->State
+ZIPCode->City
+ZIPCode->CountyName
+ZIPCode->EmergencyService
+ZIPCode->HospitalName
+ZIPCode->PhoneNumber
+ZIPCode->ProviderNumber
+ZIPCode->State
+Precision: 0.5532
+Recall: 0.9286
+F1: 0.6933
+Runtime: 13117 ms

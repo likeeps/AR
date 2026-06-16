@@ -1,0 +1,8 @@
+AirportCode->AirportName
+AirportName->AirportCode
+Disposition->Status
+Status->Disposition
+Precision: 1.0000
+Recall: 1.0000
+F1: 1.0000
+Runtime: 3237 ms

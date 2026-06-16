@@ -1,0 +1,5 @@
+HigherTaxonName->HigherTaxonRank
+Precision: 1.0000
+Recall: 1.0000
+F1: 1.0000
+Runtime: 338 ms
