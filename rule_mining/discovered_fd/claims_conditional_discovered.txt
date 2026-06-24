@@ -1,0 +1,21 @@
+AirlineName,DateReceived,Status->Disposition
+AirlineName,Disposition->Status
+AirlineName,Status->Disposition
+AirportCode->AirportName
+AirportCode,Disposition->Status
+AirportCode,Status->Disposition
+AirportName->AirportCode
+AirportName,Disposition->Status
+AirportName,Status->Disposition
+ClaimAmount,IncidentDate,Status->Disposition
+ClaimAmount,Item,Status->Disposition
+CloseAmount,Status->Disposition
+DateReceived,Disposition->Status
+DateReceived,Status->Disposition
+Disposition->Status
+IncidentDate,Item,Status->Disposition
+Status->Disposition
+Precision: 0.2353
+Recall: 1.0000
+F1: 0.3810
+Runtime: 13174 ms

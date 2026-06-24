@@ -1,0 +1,4 @@
+AirportCode->AirportName
+AirportName->AirportCode
+Status->Disposition
+Disposition->Status

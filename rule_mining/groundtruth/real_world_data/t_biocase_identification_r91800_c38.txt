@@ -1,0 +1,14 @@
+ScientificName->SubspeciesEpithet
+FullScientificNameString->Subgenus
+ScientificName->SpeciesEpithet
+FullScientificNameString->SpeciesEpithet
+FullScientificNameString->GenusOrMonomial
+FullScientificNameString->SubspeciesEpithet
+ScientificName->FullScientificNameString
+ScientificName->GenusOrMonomial
+ScientificName->Subgenus
+FullScientificNameString->ScientificName
+FullScientificNameString->AuthorTeamParenthesisAndYear
+FullScientificNameString->AuthorTeamOriginalAndYear
+ScientificName->AuthorTeamOriginalAndYear
+ScientificName->AuthorTeamParenthesisAndYear

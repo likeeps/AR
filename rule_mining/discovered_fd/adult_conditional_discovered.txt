@@ -1,0 +1,6 @@
+education->education_num
+education_num->education
+Precision: 1.0000
+Recall: 1.0000
+F1: 1.0000
+Runtime: 14387 ms

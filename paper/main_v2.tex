@@ -1,0 +1,539 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{AR: Approximate Functional Dependency Discovery via Any-Order Conditional Transformer}
+
+\author{
+\IEEEauthorblockN{Congrui Liu}
+\IEEEauthorblockA{\textit{Affiliation} \\
+City, Country \\
+email@example.com}
+}
+
+\maketitle
+
+\begin{abstract}
+Approximate functional dependencies (AFDs) support schema understanding, data cleaning, and integration, yet reliable discovery remains difficult in sparse and noisy tables. Error-based methods are sensitive to cardinality bias, whereas contingency-table-based correlation methods degrade on NULL-dominated and high-cardinality columns. This paper presents AR, an any-order conditional Transformer framework for AFD discovery that combines learned conditional distributions with empirical support statistics. AR represents each tuple as a column sequence, trains the model with random observation masking and an AFD-oriented auxiliary objective, calibrates per-column predictive distributions, and scores candidates through adaptive fusion of model and empirical signals. The method further introduces valid-RHS renormalization, support compression with shrinkage, direction-aware filtering, bidirectional singleton recovery, and profile-driven adaptation of training and search behavior. On the four benchmark datasets shared with the recent CAFD study, AR improves the reported F1 score on Adult, Claims, and DBLP10K, while trailing on Hospital. Across nine evaluated datasets, AR attains perfect F1 on Adult, Claims, and BioCase HigherTaxon, and recall above 0.92 on Hospital and DBLP10K. The remaining errors are concentrated on identifier-heavy or weakly curated schemas, where precision remains the main challenge.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Approximate functional dependencies, Transformer, conditional probability estimation, tabular data, cardinality bias, data quality
+\end{IEEEkeywords}
+
+\section{Introduction}\label{sec:intro}
+
+Functional dependencies (FDs)~\cite{tane,fastfd} are a basic abstraction for relational data. An FD $X \to A$ states that tuples agreeing on the left-hand side (LHS) attribute set $X$ must also agree on the right-hand side (RHS) attribute $A$. FDs support normalization, entity resolution, data cleaning, and query optimization. In real data, however, exact FDs are often broken by noise, missing values, or inconsistent coding, which motivates the discovery of \emph{approximate functional dependencies} (AFDs)~\cite{afd_survey,pyro,measure_study}.
+
+Two difficulties dominate practical AFD discovery. First, classical error measures such as $g_1$ tend to reward high-cardinality LHSs because sparsity hides violations~\cite{g1_error,fdx}. Second, exhaustive lattice traversal scales poorly as the number of attributes grows~\cite{afd_survey}. Recent statistical methods, especially CAFD~\cite{cafdui}, mitigate part of this problem by using normalized correlation measures and pruning, but they still depend on contingency-table density assumptions and become fragile when columns are sparse, highly imbalanced, or dominated by NULLs.
+
+AR adopts a different strategy: instead of constructing a contingency table for every candidate, it learns a conditional probability model over columns. The central idea is to estimate $P(A \mid X)$ for arbitrary observed column subsets through masking, so that dependency discovery can be recast as repeated conditional queries rather than repeated table reconstruction. These learned distributions are not used in isolation. AR combines Transformer predictions with empirical support statistics, probability calibration, support filtering, directionality checks, and profile-driven search adaptation.
+
+The paper makes four contributions.
+\begin{enumerate}
+    \item It introduces an any-order conditional Transformer formulation for AFD discovery, enabling direct estimation of $P(A \mid X)$ for arbitrary LHS/RHS configurations without committing to a fixed column order.
+    \item It develops a coverage-aware dual-signal scoring framework that combines model probabilities with empirical support statistics through valid-RHS renormalization, asymmetric empirical correction, and identifier-aware boosting.
+    \item It integrates these components into a practical search procedure with data-driven auto-profiling, directionality control, minimality filtering, and bidirectional singleton recovery.
+    \item It presents an empirical study over nine datasets and four published benchmark overlaps, together with an explicit analysis of where the method succeeds and where it remains weak.
+\end{enumerate}
+
+\section{Related Work}\label{sec:related}
+
+\subsection{Exact FD Discovery}
+Exact FD discovery is commonly divided by scalability trade-offs. \textbf{Row-efficient} methods such as TANE~\cite{tane}, FD-mine~\cite{fdmine}, and DFD~\cite{dfd} enumerate the attribute lattice level by level, but suffer from exponential candidate growth. \textbf{Column-efficient} methods including FDEP~\cite{fdep}, FastFDs~\cite{fastfd}, and Dep-Miner~\cite{depminer} rely on tuple-pair comparisons and behave better in high dimensions while becoming expensive in the number of tuples. \textbf{Hybrid} methods such as HYFD~\cite{hyfd} and DHYFD~\cite{dhyfd} combine both views. Recent systems including EulerFD~\cite{eulerfd} and hitting-set-based approaches~\cite{hittingset} further improve efficiency through approximation or combinatorial reformulation.
+
+\subsection{Approximate FD Discovery}
+AFD methods mainly differ in how they quantify ``approximate.'' \textbf{Error-based} methods such as thresholded TANE~\cite{tane}, DAFD~\cite{dafd}, and PYRO~\cite{pyro} use violation rates, but are known to overvalue large or sparse LHSs. Variants such as FDM~\cite{fdm} and CORDS~\cite{cords} partially reduce this issue without eliminating it. \textbf{Entropy-based} methods such as RFI~\cite{rfi} and SMI~\cite{smi} measure uncertainty reduction, but RFI is costly because of permutation testing and SMI still weakens on high-cardinality data. \textbf{Structure-learning} methods such as FDX~\cite{fdx} cast dependency discovery as a statistical learning problem, but their assumptions are less suitable for many-to-one or highly non-linear mappings.
+
+\subsection{CAFD and Learning-Based Alternatives}
+CAFD~\cite{cafdui} is the most relevant recent baseline. It introduces a normalized contingency-based score, directionality via dominance asymmetry, and category merging to preserve correlation under sparsity. Its main limitation is that all evidence still flows through contingency tables. AR instead uses a neural conditional model to answer many different $P(A \mid X)$ queries while retaining empirical statistics as a correction signal. This places AR closer to modern tabular conditional modeling approaches~\cite{tabnet,tabtransformer}, but unlike generic tabular predictors, AR is explicitly engineered for dependency search rather than supervised label prediction.
+
+\section{Problem Formulation}\label{sec:problem}
+
+Let $R$ be a relational schema and let $D$ be a finite sample from an unknown joint distribution $P_R$ over $\mathrm{dom}(R)$. For an attribute set $X \subseteq R$ and an attribute $A \in R \setminus X$, we study whether conditioning on $X$ makes the distribution of $A$ sharply concentrated.
+
+\begin{definition}[Approximate Functional Dependency]
+For $\epsilon \in [0,1)$, we say that $X \to A$ is an $\epsilon$-AFD under $P_R$ if there exists a function $f:\mathrm{dom}(X)\to\mathrm{dom}(A)$ such that
+\begin{equation}
+    P_R(A = f(x) \mid X = x) \ge 1-\epsilon
+\end{equation}
+for every $x$ in the support of $X$.
+\end{definition}
+
+This definition avoids the normalization problem of assigning the same mass $\epsilon$ to all non-dominant RHS values. Exact FDs correspond to $\epsilon = 0$. We are interested in \emph{minimal} and \emph{non-trivial} AFDs, i.e., candidates for which no strict subset of $X$ already determines $A$, and $A \notin X$.
+
+An intuitive example is $(\textit{city}, \textit{street}) \to \textit{zip code}$. If almost every city--street pair is associated with one dominant zip code, then the conditional distribution $P(\textit{zip code}\mid \textit{city},\textit{street})$ becomes much sharper than the marginal distribution of zip codes. This observation motivates the operational proxy used by AR: instead of estimating $\epsilon$ directly, the method measures how strongly conditioning on $X$ concentrates the distribution of $A$ relative to $P(A)$. In effect, AFD discovery is treated as a ranking problem over conditional distributions, followed by minimality and directionality filtering.
+
+\section{Method}\label{sec:method}
+
+\subsection{Overview of AR}
+
+AR is organized as a four-stage pipeline. First, preprocessing converts a heterogeneous table into a tokenized column-aligned representation and determines which attributes are eligible for LHS and RHS search. Second, the any-order conditional Transformer is trained to answer arbitrary conditional queries of the form $P(A \mid X)$. Third, temperature scaling calibrates the resulting per-column predictive distributions. Fourth, AFD discovery is performed through support-set construction, dual-signal scoring, directionality and minimality filtering, and beam-style search. Returning to the running example above, the method ultimately asks whether the calibrated distribution of zip code conditioned on city and street is both sharp enough and sufficiently supported to justify reporting a dependency. The remainder of this section describes these components in the same order.
+
+\subsection{Design Rationale}
+
+Several components of AR are best understood through the failure modes they are intended to address. Table~\ref{tab:design_rationale} summarizes this mapping and makes explicit why the method contains multiple scoring and search safeguards rather than a single monolithic confidence score. At a high level, AR separates three questions that many AFD methods implicitly conflate: what mapping the model predicts, how strongly the observed data support that mapping, and whether the resulting rule is meaningful rather than trivial or symmetric.
+
+\begin{table}[t]
+\caption{Failure Modes Targeted by AR}
+\label{tab:design_rationale}
+\centering
+\scriptsize
+\begin{tabular}{p{1.75cm}p{2.35cm}p{2.75cm}}
+\toprule
+\textbf{Challenge} & \textbf{Typical Failure} & \textbf{AR Response} \\
+\midrule
+NULL-heavy RHS & Confidence collapses onto special tokens rather than informative values & Valid-RHS renormalization; adaptive empirical boost \\
+Sparse or high-cardinality patterns & Tiny support sets or rare values distort empirical or learned scores & Support shrinkage; coverage penalty; adaptive model/empirical blending \\
+Identifier-like columns & Near-unique attributes yield trivial RHSs or over-specified LHSs & Role-based search-space filtering; identifier-aware score correction; minimality filtering \\
+Near-bijective pairs & Forward and reverse directions are both strong & Direction margin with reverse-score comparison; bidirectional singleton recovery \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Preprocessing and Search Space Construction}\label{sec:preprocess}
+
+\subsubsection{Tokenization and Column Typing}
+
+The preprocessing stage converts each dataset into column-local token vocabularies and train/validation/test splits. Text values are normalized and canonicalized; discrete numeric values are standardized; continuous values may be discretized by quantiles when approximate search benefits from a categorical representation. Every column vocabulary reserves dedicated symbols for missing, unknown, masked, and very rare values.
+
+This representation provides a common discrete interface for all downstream components. After preprocessing, each tuple is treated as a short sequence of column-specific tokens with explicit handling of missingness and masking, which allows training and search to operate on a unified space. The point of this step is not to erase the heterogeneity of the data, but to place mixed-type columns into a shared finite state space in which conditional queries can be compared consistently.
+
+\subsubsection{Searchable Attribute Roles}
+
+A role-assignment step further labels columns by search function. Constant columns and externally designated target columns are excluded. Identifier or quasi-identifier columns may appear on the LHS but are blocked on the RHS by default because near-unique RHS attributes trivially generate uninformative dependencies. In general, categorical and discretized attributes are preferred as RHS candidates, whereas continuous attributes are primarily used to condition LHS patterns. This role separation is conceptually important: AFD discovery is not only about predicting values accurately, but about searching for determinants that remain interpretable and non-trivial.
+
+\subsection{Any-Order Conditional Transformer}\label{sec:arch}
+
+\subsubsection{Input Representation}
+
+AR models each table row as a short sequence of columns. The sequence view is purely a computational device: columns are treated as positions so that self-attention can model interactions among attributes, not because the table has an intrinsic temporal order. For column position $i$, the input embedding is
+\begin{equation}
+    \mathbf{h}_i^{(0)} = \mathbf{v}_i + \mathbf{c}_i + \mathbf{t}_i + \mathbf{o}_i,
+\end{equation}
+where $\mathbf{v}_i$ is the column-local value embedding, $\mathbf{c}_i$ is the column identity embedding, $\mathbf{t}_i$ is the column-type embedding, and $\mathbf{o}_i$ is a learned embedding indicating whether the value is observed or masked in the current query.
+
+These four components encode complementary information: the realized value, the attribute identity, the coarse column type, and the observation state under the current query. The observation embedding is particularly important because it distinguishes genuine evidence from values that are only present as masked placeholders.
+
+\subsubsection{Encoder and Query Semantics}
+
+The encoder is a lightweight Pre-LayerNorm Transformer with GELU activations and column-specific output heads. This design is sufficient because the schema widths considered in AFD discovery are typically modest, while the prediction space remains column-dependent.
+
+The key property is \emph{any-order conditioning}: the model can predict any masked column from any subset of observed columns without committing to a fixed column order. This fits AFD discovery, where arbitrary subsets can appear on the LHS. A fixed left-to-right predictor would privilege one attribute order, whereas dependency search must be able to ask for $P(A \mid X)$ regardless of how $X$ is ordered or which subset of columns it contains.
+
+Operationally, each candidate query can be viewed as a masked conditional prediction task. For example, if city and street form the LHS and zip code is the RHS, the model keeps the city and street values visible, masks the zip-code field, and returns the conditional distribution over possible zip codes. Strong AFDs are expected to induce highly concentrated conditional distributions across many support patterns.
+
+\subsection{Training and Calibration}\label{sec:training}
+
+\subsubsection{Dual-Objective Training}
+
+Training combines two losses:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\mathrm{cond}} + \lambda \mathcal{L}_{\mathrm{afd}}.
+\end{equation}
+
+\textbf{General conditional loss.} For each row, a random observed-column ratio is sampled so that the model sees lightly, moderately, and heavily conditioned queries. Observed columns remain visible and the rest are masked. Cross-entropy is then computed over all masked columns.
+
+\textbf{AFD-oriented loss.} The training loop additionally samples one searchable RHS column and a random LHS subset of size $1$ to $k_{\max}$, where $k_{\max}$ is the current maximum LHS size used in search. Only the sampled LHS columns are marked observed; only the RHS column is predicted. This auxiliary task directly matches the inference pattern used during dependency search.
+
+The two objectives serve complementary functions. The general conditional loss captures broad inter-column regularities, whereas the AFD-oriented loss biases the model toward the asymmetric ``predict-one-RHS-from-an-LHS-subset'' queries that dominate the search stage. The former captures global table structure, while the latter aligns training with the specific inference pattern used during dependency search.
+
+\textbf{Class weighting and optimization.} Each column receives inverse-frequency class weights
+\begin{equation}
+    w(v) \propto \left(\frac{1}{\mathrm{count}(v)+1}\right)^\gamma,
+\end{equation}
+so that frequent categories do not dominate the objective; the mask token is excluded from this weighting. Optimization uses a standard adaptive optimizer with regularization, gradient control, and early stopping.
+
+\subsubsection{Probability Calibration}
+
+Because downstream scoring depends on calibrated probabilities rather than only on class rankings, AR applies temperature scaling~\cite{temp_scaling} and learns a temperature $T_j$ for each searchable RHS column by minimizing validation negative log-likelihood:
+\begin{equation}
+    T_j^\star = \arg\min_T \sum_{(x,y)\in \mathcal{D}_{\mathrm{val}}} -\log \mathrm{softmax}(\mathbf{z}_j/T)_y.
+\end{equation}
+A separate temperature is therefore estimated for each RHS column on held-out data.
+
+Calibration is essential because the search layer depends on the shape of the full conditional distribution rather than on top-1 prediction alone. Overconfident logits would exaggerate dependency strength, whereas underconfident logits would flatten genuinely sharp rules. Temperature scaling improves the reliability of the subsequent entropy- and top-1-based scoring functions and therefore provides a cleaner bridge from predictive modeling to dependency ranking.
+
+\subsection{Support Set Estimation}\label{sec:support}
+
+\subsubsection{Support Construction}
+
+Scoring does not query the model on all observed training rows. For each candidate LHS $X$, AR builds a compact support table from the training split using efficient grouping and counting routines. Patterns containing special or non-informative LHS states are removed.
+
+The support table serves as a compressed representation of the LHS configurations that are relevant for evaluating a candidate. For a rule such as $(\textit{city}, \textit{street}) \to \textit{zip code}$, each retained support row corresponds to one concrete LHS pattern together with its frequency and its observed RHS behavior. If thousands of tuples share exactly the same city--street combination, querying the model once for that pattern and weighting the result is both more efficient and statistically cleaner than repeating the same query thousands of times.
+
+The support table stores raw counts, effective non-special RHS counts, empirical RHS entropies, empirical top-1 probabilities, and weighted probabilities over LHS patterns. A pattern is retained when it meets at least one of several criteria: minimum raw support, minimum effective support, or very high empirical row purity. Retained patterns are then ranked by
+\begin{equation}
+    \mathrm{priority}(\mathbf{e}) = (n_{\mathrm{eff}}(\mathbf{e})+1)^\alpha \cdot \rho_{\mathrm{nonnull}}(\mathbf{e})^\beta
+\end{equation}
+where $\alpha$ and $\beta$ control the preference for well-supported and non-NULL patterns. The head of the ranking is kept directly and the tail is filled by quantile sampling, which preserves both frequent and informative rare patterns.
+
+This head-plus-tail construction balances efficiency and fidelity. Retaining only the most frequent patterns would miss rare but informative configurations, whereas retaining all patterns would substantially increase search cost and noise. Conceptually, support construction answers a central question for AR: which LHS patterns are representative enough to carry evidence about the candidate dependency?
+
+\subsubsection{Probability Assignment and Degeneracy Control}
+
+Support probabilities are smoothed toward an independence prior:
+\begin{align}
+    w_{\mathrm{emp}}(\mathbf{e}) &= \frac{n(\mathbf{e})}{n(\mathbf{e})+\beta_s}, \\
+    \tilde{p}(\mathbf{e}) &\propto \hat{p}_{\mathrm{emp}}(\mathbf{e}) + \eta \bigl(1-w_{\mathrm{emp}}(\mathbf{e})\bigr)\prod_{i\in X}\hat{p}_i(e_i),
+\end{align}
+followed by normalization over retained support rows. The same $w_{\mathrm{emp}}$ later acts as an empirical-confidence signal.
+
+The smoothing scheme assigns greater authority to well-supported patterns and shrinks weakly supported patterns toward an independence-style prior. As a result, small empirical samples do not dominate the final candidate score. Intuitively, the method trusts frequent patterns, discounts fragile ones, and avoids mistaking sparse coincidence for reliable structure.
+
+Finally, AR applies \emph{degenerate pattern softening}: if a retained support row alone occupies most of the retained mass, its count is downweighted. This prevents a dominant pseudo-value such as a missingness-derived placeholder from overwhelming the rest of the distribution.
+
+\subsection{Dual-Signal Candidate Scoring}\label{sec:scoring}
+
+\subsubsection{Model and Empirical Signals}
+
+Candidate scoring is organized around three questions: what the calibrated model predicts, what the observed support rows suggest empirically, and how trustworthy that evidence is. For each support row $\mathbf{e}$, AR therefore obtains the Transformer's conditional distribution over the RHS and compares it with an empirical RHS distribution derived from the support table. Importantly, entropy and top-1 probability are computed on the \emph{valid RHS vocabulary only}: probability mass assigned to special tokens for missingness, masking, or ultra-rare values is removed and the remaining mass is renormalized. This choice is critical on NULL-heavy columns.
+
+This valid-RHS renormalization addresses an important failure mode of neural scoring on dirty tables. Without it, a model could appear highly confident merely because most of its mass is assigned to missingness; however, dependency discovery requires concentration on informative RHS values rather than on absence of information itself.
+
+Given a marginal RHS distribution $P(A)$ and a conditional distribution $P(A\mid \mathbf{e})$, the row-wise model signals are
+\begin{align}
+    s_{\mathrm{ent}}^{(\mathrm{mdl})}(\mathbf{e}) &= 1 - \frac{H(P(A\mid \mathbf{e}))}{H(P(A))}, \\
+    s_{\mathrm{acc}}^{(\mathrm{mdl})}(\mathbf{e}) &= \frac{\max_v P(A{=}v\mid \mathbf{e}) - \max_v P(A{=}v)}{1-\max_v P(A{=}v)}.
+\end{align}
+Empirical signals $s_{\mathrm{ent}}^{(\mathrm{emp})}$ and $s_{\mathrm{acc}}^{(\mathrm{emp})}$ are computed analogously from the empirical RHS distribution stored in the support table. All row-wise signals are aggregated by the support probabilities $\tilde{p}(\mathbf{e})$.
+
+The two signal families capture distinct aspects of dependency strength. The entropy signal measures reduction in overall uncertainty, whereas the accuracy signal measures the increase in dominance of the most probable RHS value. Strong AFDs often improve both, but not necessarily to the same degree. This separation is useful because some rules mostly sharpen the entire RHS distribution, while others mainly strengthen one dominant value.
+
+\subsubsection{Adaptive Fusion and Coverage Control}
+
+The purpose of adaptive fusion is not to average two estimates uniformly, but to decide when learned evidence should dominate and when empirical evidence should correct it. The empirical blend weight depends on RHS cardinality, LHS identifier strength, and support coverage. Let $u_A$ denote the RHS unique-value ratio and let
+\begin{equation}
+    s_{\mathrm{id}} = \frac{1}{|X|}\sum_{i\in X}\mathrm{ramp}(u_i, 0.65, 0.90).
+\end{equation}
+AR further derives a cardinality factor $c_{\mathrm{card}}$ that increases when the RHS lies in regimes where purely neural or purely empirical evidence is likely to be unreliable on its own. The resulting blend is
+\begin{equation}
+    \alpha_{\mathrm{blend}} = \mathrm{clip}\!\left(\alpha_0 + \alpha_1 c_{\mathrm{card}} + \alpha_2 c_{\mathrm{card}} s_{\mathrm{id}},\, 0,\, 0.9\right),
+\end{equation}
+after multiplying by a coverage factor.
+
+The blend emphasizes both low-cardinality and high-cardinality RHS cases for different reasons. Low-cardinality columns typically admit reliable empirical summaries, whereas high-cardinality columns benefit from empirical assistance primarily when the LHS is strongly identifier-like. Medium-cardinality columns are generally the regime in which the learned model is most informative.
+
+The coverage factor averages four signals: retained support-row count, effective support-row count, effective retained mass, and weighted non-NULL ratio. Hence, a candidate is penalized not only for having few rows but also for concentrating its mass on low-quality or NULL-heavy evidence. Coverage therefore plays the role of an evidence-quality controller rather than a mere size penalty.
+
+AR then fuses model and empirical signals asymmetrically. If empirical evidence is stronger, the full empirical bonus is applied; if empirical evidence is weaker, only half that correction is used, so that empirical statistics can restrain overconfident predictions without suppressing genuinely strong model evidence too aggressively. The final candidate score is
+\begin{equation}
+    \mathrm{score}(X \to A) = \mathrm{clip}\!\left(\alpha \bar{s}_{\mathrm{ent}} + (1-\alpha)\bar{s}_{\mathrm{acc}}\right)\cdot f_{\mathrm{cov}}.
+\end{equation}
+
+The asymmetric design reflects the intended role of empirical evidence as a corrective signal. When empirical statistics indicate that the model is missing a strong dependency, the score is allowed to increase substantially; when empirical evidence is weaker, the downward correction is applied more conservatively because the empirical estimate itself may be unstable. The overall effect is to reward candidates whose conditional distributions are both sharp and credibly supported, without letting either the model or the raw counts dominate in every regime.
+
+Two corrective mechanisms are particularly important in practice.
+\begin{enumerate}
+    \item \textbf{Adaptive boost for NULL-dominated failures.} When the empirical signal is substantially stronger than the model signal on sufficiently supported, missingness-heavy cases, AR increases the empirical blend and correspondingly reduces model dominance.
+    \item \textbf{Identifier-aware override.} When the LHS behaves like a near-identifier and the empirical signal is already close to deterministic, AR moves the final score further toward empirical evidence. This directly addresses cases where a genuine near-deterministic rule is underfit by the model.
+\end{enumerate}
+
+\subsection{Directionality, Minimality, and Search}\label{sec:search}
+
+\subsubsection{Directionality and Minimality}
+
+High confidence alone is not sufficient for reporting an AFD: a candidate may still be symmetric, redundant, or trivially strengthened by an almost unique column. Directionality is therefore decided from \emph{model accuracy}, not from the final blended score. For a candidate $X \to A$, AR computes
+\begin{equation}
+    \delta_{\mathrm{dir}} = s_{\mathrm{acc}}^{(\mathrm{mdl})}(X \to A) - \max_{B \in X} s_{\mathrm{acc}}^{(\mathrm{mdl})}(A \to B),
+\end{equation}
+where the reverse term is approximated by the best singleton reverse score. For multi-column LHSs, AR relaxes the required margin instead of computing an exact reverse $A \to X$ score, which would be considerably more expensive.
+
+This margin provides a lightweight asymmetry test. If the reverse mapping is equally strong, the candidate is better interpreted as a near-bijection than as a directional dependency. AR bases this test on model accuracy alone because blended empirical scores are more appropriate for strength estimation than for directional comparison.
+
+Minimality is enforced by comparing each compound candidate against already accepted subsets with the same RHS. If the score gain does not exceed a profiled threshold $\delta_{\mathrm{gain}}$, the larger LHS is discarded as redundant. Extra penalties are applied when the compound LHS contains near-unique columns.
+
+This filtering suppresses over-specified rules that appear strong only because an almost unique attribute has been appended to an already informative determinant.
+
+\subsubsection{Search Procedure}
+
+Search itself proceeds in two phases. Level 1 scores all singleton LHS candidates for each RHS. Their model accuracy values define a pruning pool similar in spirit to CAFD's correlation-guided pruning. AR then expands only the top beam up to $k_{\max}$ columns. After the main search, AR performs a \emph{bidirectional singleton recovery} pass: if $A \to B$ is discovered with strong singleton evidence, AR explicitly checks whether $B \to A$ should also be reported.
+
+The overall search procedure can therefore be summarized as an initial singleton screening stage, a restricted expansion stage over promising LHS combinations, and a final cleanup stage consisting of minimality filtering and bidirectional singleton recovery. This structure converts the original exponential search problem into a focused exploration around determinants that already exhibit strong conditional evidence.
+
+\begin{algorithm}[t]
+\caption{AR Search Pipeline}
+\label{alg:ar}
+\begin{algorithmic}[1]
+\REQUIRE Preprocessed schema, trained Transformer, calibrated temperatures
+\ENSURE Minimal non-trivial AFD set $\mathcal{F}$
+\STATE $\mathcal{F} \leftarrow \emptyset$
+\FOR{each searchable RHS $A$}
+    \STATE score all singleton candidates $\{B\}\to A$
+    \STATE keep accepted singletons and build a pruned singleton pool
+    \STATE initialize beam from top surviving singleton candidates
+    \FOR{$\ell = 2$ to $k_{\max}$}
+        \STATE expand current beam with columns from the pruned pool
+        \STATE score each new candidate using support estimation and dual-signal fusion
+        \STATE discard candidates that fail score, coverage, direction, or gain tests
+        \STATE keep top accepted candidates as the next beam
+    \ENDFOR
+\ENDFOR
+\STATE perform bidirectional recovery for strong singleton dependencies
+\STATE apply minimality filtering within each RHS group
+\RETURN $\mathcal{F}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Data-Driven Auto-Profiling}\label{sec:autoprofile}
+
+AR does not use one fixed configuration for all datasets. Before training and search, it samples the data and computes summary signals: searchable LHS/RHS counts, identifier-LHS strength, low-cardinality RHS strength, high-cardinality RHS strength, and statistics on estimated identifier pattern counts.
+
+\subsubsection{Profiling Signals}
+
+These statistics characterize whether the current dataset is dense or sparse, simple or difficult, and dominated or not dominated by identifier-like attributes. The resulting profile determines how conservative the subsequent training and search configuration should be. Its role is not generic auto-tuning, but adaptation to the specific failure modes that different tables induce.
+
+\subsubsection{Adaptation Policy}
+
+These signals drive the relative emphasis of the AFD-oriented loss, the amount of training, the strength of support smoothing, the support budget, the score thresholds, the model-versus-empirical blend, and the maximum explored LHS size. Conceptually, the profiler makes AR more conservative on clean low-dimensional schemas and more empirically assisted on sparse, high-cardinality, or identifier-heavy schemas.
+
+The adaptation policy therefore acts as a bridge between method design and dataset structure: rather than assuming one globally optimal operating point, AR chooses a search posture that is consistent with the observed statistical profile of the table. It is therefore best viewed as a structured robustness mechanism rather than a collection of unrelated tuning rules.
+
+\subsection{Computational Complexity and Practical Cost}\label{sec:complexity}
+
+Let $m$ denote the number of columns, $d$ the hidden size, $L$ the number of Transformer layers, $B$ the batch size, and $d_{ff}$ the feed-forward width. The training cost per batch follows the standard Transformer pattern
+\begin{equation}
+    O\!\left(L \cdot B \cdot m^2 d + L \cdot B \cdot m d d_{ff}\right).
+\end{equation}
+Because the effective schema sizes in the evaluated workloads are small (3--30 attributes after preprocessing), the practical training cost is driven less by sequence length than by the number of optimization steps and later search-time queries.
+
+For search, the cost of scoring a candidate is dominated by two operations: building its support table from the training split and querying the calibrated model on the retained support rows. AR bounds the number of retained support rows by a dataset-dependent cap and restricts exploration through beam-style expansion. In the current study, the explored LHS size is also kept small, so the realized search space is far smaller than the full powerset lattice. The runtime measurements reported later should therefore be interpreted as the cost of a heavily pruned, support-bounded search procedure rather than that of exhaustive enumeration.
+
+\section{Experiments}\label{sec:exp}
+
+\subsection{Experimental Setup}
+
+All AR numbers in this section are drawn from completed experimental runs under a fixed evaluation protocol. A prediction is counted as correct only when the RHS and the full LHS set exactly match a ground-truth rule, ignoring only the order of LHS attributes. Reported runtime is \emph{search-phase runtime only}; it excludes preprocessing, model training, and temperature calibration.
+
+\subsubsection{Reproducibility Protocol}
+
+Each dataset is preprocessed once into train/validation/test splits using a fixed random seed. Search is then performed with the corresponding calibrated model and the dataset-specific configuration selected by the auto-profiling policy. Unless otherwise noted, the paper reports the default profiled setting associated with each completed run. This protocol is narrower than a full retraining benchmark, but it provides a stable basis for analyzing the behavior of AR under a consistent experimental setup.
+
+\subsubsection{Datasets and Ground Truth}
+
+Our experimental collection contains ten processed datasets, but one auxiliary BioCase variant does not have aligned standardized ground truth for exact-match evaluation. We therefore report nine datasets with matched search outputs and ground truth. Table~\ref{tab:datasets} lists the effective schema sizes after preprocessing.
+
+\begin{table}[t]
+\caption{Evaluation Datasets Used in This Paper (Effective Attributes After Preprocessing)}
+\label{tab:datasets}
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Dataset} & \textbf{Tuples} & \textbf{Attrs.} & \textbf{GT FDs} \\
+\midrule
+Adult & 32,561 & 14 & 2 \\
+Claims & 97,231 & 12 & 4 \\
+Hospital & 114,919 & 15 & 28 \\
+DBLP10K & 10,000 & 30 & 77 \\
+Tax & 1,000,000 & 15 & 3 \\
+BioCase Gathering & 90,991 & 6 & 1 \\
+BioCase NamedAreas & 137,710 & 6 & 5 \\
+BioCase HigherTaxon & 562,958 & 3 & 1 \\
+BioCase Identification & 91,799 & 8 & 14 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Comparison Scope}
+
+For comparison with existing methods, we use the published benchmark F1 scores reported in CAFD~\cite{cafdui} on the four overlapping datasets Adult, Claims, Hospital, and DBLP10K. We treat these as \emph{reference numbers}, not as strict apples-to-apples reruns, because they were obtained under different experimental stacks, hardware, and, in some cases, slightly different evaluation protocols.
+
+\subsection{Shared-Benchmark Comparison}
+
+Table~\ref{tab:benchmark_f1} shows AR against the published reference numbers. AR improves the reported F1 score on Adult, Claims, and DBLP10K, but not on Hospital.
+
+\begin{table}[t]
+\caption{F1 Comparison on Four Shared Benchmarks. Non-AR entries are quoted from~\cite{cafdui}.}
+\label{tab:benchmark_f1}
+\centering
+\scriptsize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Adult} & \textbf{Claims} & \textbf{Hospital} & \textbf{DBLP10K} \\
+\midrule
+TANE & 0.043 & 0.009 & 0.158 & -- \\
+FDEP & 0.018 & 0.045 & 0.143 & 0.046 \\
+HYFD & 0.050 & 0.222 & 0.378 & 0.001 \\
+PYRO & 0.018 & 0.054 & 0.143 & 0.046 \\
+RFI & -- & -- & -- & -- \\
+SMI & 0.235 & 0.353 & 0.233 & 0.072 \\
+FDX & 0.000 & 0.143 & 0.049 & 0.000 \\
+CAFD & 0.800 & 0.890 & 0.780 & 0.580 \\
+\midrule
+AR & \textbf{1.000} & \textbf{1.000} & 0.693 & \textbf{0.676} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The strongest gains appear on deterministic code-to-name style mappings, such as Adult and Claims, where bidirectional singleton recovery and calibrated conditional probabilities align well with the ground truth. DBLP10K benefits from stronger empirical assistance on high-cardinality columns. Hospital is more mixed: AR achieves high recall but lower precision than the published CAFD result, suggesting that the current search heuristics still admit too many semantically weak candidates on medium-cardinality columns.
+
+\subsection{Evaluation Across Nine Datasets}
+
+Table~\ref{tab:repo_results} reports the AR results on all nine datasets.
+
+\begin{table}[t]
+\caption{AR Results Across Nine Datasets}
+\label{tab:repo_results}
+\centering
+\scriptsize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Disc.} & \textbf{GT} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{Search (s)} \\
+\midrule
+Adult & 2 & 2 & 1.000 & 1.000 & \textbf{1.000} & 3.7 \\
+Claims & 4 & 4 & 1.000 & 1.000 & \textbf{1.000} & 3.2 \\
+Hospital & 47 & 28 & 0.553 & 0.929 & \textbf{0.693} & 13.1 \\
+DBLP10K & 133 & 77 & 0.534 & 0.922 & \textbf{0.676} & 89.5 \\
+Tax & 38 & 3 & 0.079 & 1.000 & 0.146 & 110.9 \\
+\midrule
+BioCase Gathering & 10 & 1 & 0.100 & 1.000 & 0.182 & 8.6 \\
+BioCase NamedAreas & 8 & 5 & 0.375 & 0.600 & 0.462 & 0.6 \\
+BioCase HigherTaxon & 1 & 1 & 1.000 & 1.000 & \textbf{1.000} & 0.3 \\
+BioCase Identification & 29 & 14 & 0.379 & 0.786 & 0.512 & 12.4 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Main Findings}
+
+The results in Table~\ref{tab:repo_results} suggest three main observations. First, perfect precision and recall are achievable on clean deterministic pairs. Adult, Claims, and BioCase HigherTaxon all reach F1 $=1.0$. These datasets contain strong near-functional mappings that are easy to recover once identifier-like RHSs are filtered and singleton reversals are handled correctly.
+
+Second, AR tends to prioritize recall on larger or harder schemas. Hospital and DBLP10K both exceed recall $0.92$, but precision is only around $0.53$--$0.55$. This is consistent with the design of the search layer, where empirical boosting, relaxed direction margins for difficult cases, and larger support budgets primarily act to avoid false negatives.
+
+Third, identifier-like structure remains a substantial source of precision loss. Tax and several BioCase variants exhibit many extra discoveries. Some may be semantically plausible but absent from the curated ground truth; others are genuine errors induced by near-unique columns or weakly justified multi-column LHSs.
+
+\subsection{Interpretation of the Empirical Evidence}
+
+Three aspects of the empirical section merit explicit emphasis. First, the evidence is strongest as a demonstration that the AR design is viable and competitive on several standard datasets, rather than as a definitive end-to-end superiority claim over all baselines. Second, the evaluation boundary is explicit: AR values come from our completed runs, while non-AR values on the shared benchmarks are literature references. Third, the low-precision regimes are not peripheral. They expose the current limits of the method and therefore constitute a substantive part of the empirical contribution.
+
+\subsection{Discussion}
+
+These results are most informative when interpreted as a behavior analysis of the AR pipeline rather than as a universal improvement over all prior methods.
+
+\subsubsection{Success Cases}
+
+Adult and Claims contain compact, high-confidence mappings with well-covered RHS support. In this setting, calibrated Transformer predictions and empirical support statistics are sufficiently aligned to isolate the ground-truth rules with no false positives.
+
+\subsubsection{Over-Generation on Identifier-Heavy Schemas}
+
+On Tax and several BioCase datasets, the auto-profiler intentionally reduces model-dominance weights and relaxes thresholds because empirical evidence is expected to be valuable. On identifier-heavy schemas, the same mechanism can over-trust empirical regularities that do not correspond to meaningful domain rules, thereby increasing the number of false positives.
+
+\subsubsection{Remaining Difficulty on Hospital}
+
+Hospital remains challenging because it combines medium-cardinality columns, localized sparsity, and several semantically related fields that admit multiple plausible directional hypotheses. The relaxed direction tests improve recall in this setting, but they also place greater pressure on the minimality filter to suppress redundant or weakly directional rules.
+
+\subsection{Limitations and Threats to Validity}
+
+Five limitations should be noted.
+
+\textbf{Reference baselines are published numbers, not reruns.} Table~\ref{tab:benchmark_f1} provides useful context, but it does not constitute a strict controlled benchmark.
+
+\textbf{Runtime is search-only.} Preprocessing, training, and calibration are treated as offline stages. The search times in Table~\ref{tab:repo_results} therefore describe dependency discovery after a calibrated model is already available.
+
+\textbf{Ground truth is incomplete for some schemas.} The exact-match evaluation protocol is strict, and several extra discoveries on Hospital, DBLP10K, Tax, and BioCase may be valid but unlabeled. At the same time, incomplete ground truth cannot explain all low-precision cases; some are genuine modeling or search errors.
+
+\textbf{Search remains heuristic.} AR still depends on dataset-specific auto-profiled thresholds, limited LHS size, approximate reverse scoring for multi-column candidates, and identifier-related heuristics. These choices make the system practical, but they weaken theoretical completeness.
+
+\textbf{Ablation evidence remains limited.} The current experimental record contains variant runs for only a subset of datasets, and it does not yet provide a clean, uniformly logged ablation matrix that isolates every scoring and search component under a single controlled protocol. A stronger submission would include systematic component-removal studies.
+
+\section{Conclusion}\label{sec:conclusion}
+
+AR reframes AFD discovery as calibrated conditional probability estimation plus identifier-aware empirical correction. The resulting pipeline combines role-based search-space filtering, any-order conditional modeling, probability calibration, support-set construction, adaptive dual-signal scoring, and beam-style search with direction and minimality checks.
+
+The experimental evidence supports a measured conclusion. AR is particularly effective on compact, high-confidence dependencies and performs well on several benchmark datasets, especially Adult, Claims, and DBLP10K. Its main remaining weakness is precision degradation on identifier-heavy and weakly curated schemas. The most credible next steps are therefore targeted rather than expansive: stronger identifier detection, improved control of multi-column over-generation, and cleaner benchmark protocols that separate search-phase cost from end-to-end system cost.
+
+\begin{thebibliography}{00}
+
+\bibitem{cafdui}
+Q. Meng, S. Yin, F. Wang, A. Zhang, J. Zhang, and C. Zong, ``Discovering approximate functional dependencies using correlation measures,'' in \textit{Proc. Conf. Database Systems for Advanced Applications}, 2025.
+
+\bibitem{tane}
+Y. Huhtala, J. K\"arkk\"ainen, P. Porkka, and H. Toivonen, ``Tane: An efficient algorithm for discovering functional and approximate dependencies,'' \textit{The Computer Journal}, vol. 42, no. 2, pp. 100--111, 1999.
+
+\bibitem{fastfd}
+C. Wyss, C. Giannella, and E. Robertson, ``FastFDs: A heuristic-driven, depth-first algorithm for mining functional dependencies from relation instances,'' in \textit{Proc. DaWaK}, 2001, pp. 101--110.
+
+\bibitem{afd_survey}
+T. Papenbrock et al., ``Functional dependency discovery: An experimental evaluation of seven algorithms,'' \textit{Proc. VLDB Endowment}, vol. 8, no. 10, pp. 1082--1093, 2015.
+
+\bibitem{tabnet}
+A. Arik and T. Pfister, ``TabNet: Attentive interpretable tabular learning,'' in \textit{Proc. AAAI}, 2021.
+
+\bibitem{tabtransformer}
+X. Huang et al., ``TabTransformer: Tabular data modeling using contextual embeddings,'' arXiv:2012.06678, 2020.
+
+\bibitem{fdep}
+P. A. Flach and I. Savnik, ``Database dependency discovery: A machine learning approach,'' \textit{AI Communications}, vol. 12, no. 3, pp. 139--160, 1999.
+
+\bibitem{hyfd}
+T. Papenbrock and F. Naumann, ``A hybrid approach to functional dependency discovery,'' in \textit{Proc. SIGMOD}, 2016, pp. 821--833.
+
+\bibitem{pyro}
+S. Kruse and F. Naumann, ``Efficient discovery of approximate dependencies,'' \textit{Proc. VLDB Endowment}, vol. 11, no. 7, pp. 759--772, 2018.
+
+\bibitem{rfi}
+P. Mandros, M. Boley, and J. Vreeken, ``Discovering reliable approximate functional dependencies,'' in \textit{Proc. KDD}, 2017, pp. 355--363.
+
+\bibitem{smi}
+F. Pennerath, P. Mandros, and J. Vreeken, ``Discovering approximate functional dependencies using smoothed mutual information,'' in \textit{Proc. KDD}, 2020, pp. 1254--1264.
+
+\bibitem{fdx}
+Y. Zhang, Z. Guo, and T. Rekatsinas, ``A statistical perspective on discovering functional dependencies in noisy data,'' in \textit{Proc. SIGMOD}, 2020, pp. 861--876.
+
+\bibitem{measure_study}
+M. Parciak et al., ``Measuring approximate functional dependencies: A comparative study,'' in \textit{Proc. ICDE}, 2024, pp. 3505--3518.
+
+\bibitem{g1_error}
+J. Kivinen and H. Mannila, ``Approximate dependency inference from relations,'' in \textit{Proc. ICDT}, 1992, pp. 86--98.
+
+\bibitem{dfd}
+Z. Abedjan, P. Schulze, and F. Naumann, ``DFD: Efficient functional dependency discovery,'' in \textit{Proc. CIKM}, 2014, pp. 949--958.
+
+\bibitem{fdmine}
+H. Yao, H. Hamilton, and C. Butz, ``FD mine: Discovering functional dependencies in a database using equivalences,'' Univ. Regina, Tech. Rep. CS-02-04, 2002.
+
+\bibitem{depminer}
+S. Lopes, J.-M. Petit, and L. Lakhal, ``Efficient discovery of functional dependencies and Armstrong relations,'' in \textit{Proc. EDBT}, 2000, pp. 350--364.
+
+\bibitem{dhyfd}
+Z. Wei and S. Link, ``Discovery and ranking of functional dependencies,'' in \textit{Proc. ICDE}, 2019, pp. 1526--1537.
+
+\bibitem{dafd}
+X. Ding et al., ``DAFD: Discover algorithm for dynamic approximate functional dependencies on dirty data,'' \textit{Proc. VLDB Endowment}, vol. 17, no. 11, pp. 3484--3496, 2024.
+
+\bibitem{fdm}
+X. Wang, R. Jin, W. Huang, and Y. Tang, ``Boosting meaningful dependency mining with clustering and covariance analysis,'' in \textit{Proc. ICDE}, 2024, pp. 639--652.
+
+\bibitem{cords}
+I. F. Ilyas et al., ``CORDS: Automatic discovery of correlations and soft functional dependencies,'' in \textit{Proc. SIGMOD}, 2004, pp. 647--658.
+
+\bibitem{eulerfd}
+Q. Lin et al., ``EulerFD: An efficient double-cycle approximation of functional dependencies,'' in \textit{Proc. ICDE}, 2023, pp. 2878--2891.
+
+\bibitem{hittingset}
+T. Bleifu\ss{} et al., ``Discovering functional dependencies through hitting set enumeration,'' \textit{Proc. ACM Manag. Data}, vol. 2, no. 1, pp. 1--24, 2024.
+
+\bibitem{temp_scaling}
+C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger, ``On calibration of modern neural networks,'' in \textit{Proc. ICML}, 2017.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,21 @@
+AreaCode->State
+AreaCode,HasChild->ChildExemp
+AreaCode,MaritalStatus->MarriedExemp
+AreaCode,MaritalStatus->SingleExemp
+AreaCode,MarriedExemp->SingleExemp
+AreaCode,SingleExemp->MarriedExemp
+City,Rate->State
+FName->Gender
+HasChild,State->ChildExemp
+HasChild,Zip->ChildExemp
+MaritalStatus,State->MarriedExemp
+MaritalStatus,State->SingleExemp
+MaritalStatus,Zip->MarriedExemp
+MarriedExemp,State->SingleExemp
+SingleExemp,State->MarriedExemp
+Zip->City
+Zip->State
+Precision: 0.1765
+Recall: 1.0000
+F1: 0.3000
+Runtime: 389011 ms

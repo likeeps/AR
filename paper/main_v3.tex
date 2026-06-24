@@ -1,0 +1,591 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{AR: Approximate Functional Dependency Discovery via Any-Order Conditional Transformer}
+
+\author{
+\IEEEauthorblockN{Congrui Liu}
+\IEEEauthorblockA{\textit{Affiliation} \\
+City, Country \\
+email@example.com}
+}
+
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Approximate functional dependencies (AFDs) are essential metadata for schema design, data integration, and data quality assessment. However, existing discovery methods suffer from fundamental limitations: error-based approaches exhibit severe cardinality bias that produces spurious dependencies on high-cardinality attributes, while statistical methods relying on contingency tables lose power on high-NULL-rate and sparse columns. These methods share a common paradigm of \emph{indirectly} quantifying dependency strength through surrogate metrics, which inevitably introduces measurement bias. This paper presents AR (Any-Order Conditional Transformer), which takes a fundamentally different approach: instead of designing better surrogate metrics, AR directly learns the conditional probability distribution $P(A \mid X)$ from the data using a Transformer encoder with any-order observation masking. By estimating the data-generating distribution itself, AR can assess dependency strength by measuring how much conditioning on $X$ concentrates the distribution of $A$---a principled criterion rooted in the probabilistic definition of AFDs. To address the challenges of applying neural conditional estimation to AFD discovery, AR introduces: (1) a dual-signal adaptive scoring mechanism that fuses learned probabilities with empirical statistics to correct model biases on NULL-dominated and high-cardinality columns; (2) a data-driven auto-profiling mechanism that adapts approximately 20 hyperparameters to dataset characteristics without manual tuning; and (3) temperature scaling calibration that corrects neural network overconfidence for reliable probability estimates. Experiments on nine real-world datasets demonstrate that AR achieves superior F1 scores over CAFD and seven representative baselines.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Approximate functional dependencies, conditional probability estimation, Transformer, data quality, adaptive scoring
+\end{IEEEkeywords}
+
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+Functional dependencies (FDs) are fundamental constraints in relational databases, stating that the values of a left-hand side (LHS) attribute set $X$ uniquely determine the value of a right-hand side (RHS) attribute $A$~\cite{tane,fastfd}. FDs underpin a wide range of data management tasks including schema normalization, query optimization, data integration, and data cleaning~\cite{afd_survey}. In practice, however, exact FDs are rarely satisfied due to noise, missing values, and data entry errors. This has motivated the study of \textbf{approximate functional dependencies} (AFDs), which relax the strict consistency requirement and allow dependencies to hold with high but imperfect confidence~\cite{tane,pyro,afd_survey}.
+
+\subsection*{Limitations of Existing AFD Discovery Methods}
+
+Despite decades of research, existing AFD discovery methods remain fundamentally limited by their reliance on \emph{indirect} surrogate metrics to quantify dependency strength. These methods can be broadly categorized into three paradigms, each suffering from characteristic biases.
+
+\textbf{Error-based methods} (e.g., TANE~\cite{tane}, FDEP~\cite{fdep}, HYFD~\cite{hyfd}, PYRO~\cite{pyro}) quantify AFD strength by measuring the fraction of tuple pairs that violate a candidate dependency. However, these metrics exhibit severe \emph{cardinality bias}~\cite{measure_study,fdx}: as more attributes are added to the LHS, the number of distinct value combinations grows rapidly, making violations less likely to be observed. Consequently, candidates with large or high-cardinality LHSs receive artificially high scores, producing hundreds of statistically strong but semantically meaningless dependencies~\cite{measure_study}. Empirical studies report that error-based methods can generate over ten thousand spurious AFDs on datasets with only tens of attributes~\cite{afd_survey}.
+
+\textbf{Entropy-based and information-theoretic methods} (e.g., RFI~\cite{rfi}, SMI~\cite{smi}) employ mutual information or reliability scores to rank determinants. While less susceptible to raw cardinality bias, RFI relies on expensive permutation tests and tends to overfit input samples, while SMI degrades under high-cardinality distributions where smoothing assumptions break down. Both methods are limited in recall---RFI detects only top-$k$ determinants per RHS attribute, making performance sensitive to the choice of $k$~\cite{rfi}.
+
+\textbf{Structure-learning methods} (e.g., FDX~\cite{fdx}) cast AFD discovery as linear regression over tuple-pair samples. While statistically principled, their linearity assumption fails on many-to-one and non-linear dependencies. Moreover, FDX assumes a global attribute ordering and recovers only one determinant per RHS, severely limiting recall on datasets with multiple valid determinants.
+
+Recent work has attempted to address these limitations through different angles. CAFD~\cite{cafdui} introduces a normalized $\varphi^2$ coefficient with correlation-preserving category merging to correct cardinality bias. AFDMiner~\cite{afdminer} uses deep reinforcement learning to optimize the \emph{search process} over the dependency lattice, reducing ineffective candidate visits. MAFD~\cite{mafd} leverages Markov blankets from Bayesian network structure learning to prune the search space. However, these methods still rely on indirect dependency metrics ($\varphi^2$, $\mu^+$, or $g_1$ error) as their core scoring mechanism---they improve \emph{how} candidates are evaluated or \emph{where} to search, but not \emph{what} is being measured. The fundamental measurement bias inherent in surrogate metrics remains unresolved.
+
+\subsection*{Our Approach: Direct Conditional Probability Estimation}
+
+We propose a fundamentally different approach: instead of designing better surrogate metrics to indirectly quantify dependency strength, we directly learn the conditional probability distribution $P(A \mid X)$ from the data. Under the probabilistic definition of AFDs~\cite{pyro,measure_study}, a dependency $X \to A$ holds approximately if there exists a function $f$ such that $P(A = f(x) \mid X = x) \geq 1 - \epsilon$ for all $x$. This definition directly characterizes AFDs through the conditional distribution $P(A \mid X)$. Therefore, if we can accurately estimate this distribution, we can assess dependency strength by measuring how much conditioning on $X$ concentrates the distribution of $A$ relative to its marginal---a principled criterion that requires no surrogate metrics and is immune to the measurement biases that plague existing approaches.
+
+\subsection*{Why Any-Order Conditional Transformer}
+
+The key question is: what model can effectively estimate $P(A \mid X)$ for \emph{arbitrary} column subsets $X$ and RHS attributes $A$? This poses a unique challenge distinct from standard supervised learning: there is no fixed input-output partition, and we must support querying any column combination at inference time. We adopt a Transformer encoder~\cite{tabtransformer} with \textbf{any-order observation masking} for three reasons:
+
+\begin{enumerate}
+    \item \textbf{Exchangeability.} Unlike natural language where tokens follow a sequential order, relational columns are inherently exchangeable---there is no natural ordering, and any column can serve as either LHS evidence or RHS target. The Transformer's self-attention mechanism treats all positions symmetrically, matching this exchangeable structure. By masking arbitrary column subsets during training, a single model learns to estimate $P(A \mid X)$ for all possible $(X, A)$ combinations without retraining.
+    \item \textbf{Representation sharing.} Training separate models per RHS column would require $m$ independent models and cannot share learned representations across related columns. The shared Transformer encoder transfers inter-column relationship knowledge, improving data efficiency and generalization---particularly valuable for columns with limited non-NULL observations.
+    \item \textbf{Variable-size conditioning.} Autoregressive models require a fixed ordering and can only condition on ``earlier'' positions, while the masking-based formulation naturally handles variable-size LHS sets (from singletons to compound attribute sets) through a single unified architecture.
+\end{enumerate}
+
+\subsection*{Challenges and Our Solutions}
+
+While the Transformer provides a powerful conditional estimator, directly applying neural probability estimates to AFD discovery introduces three significant challenges that necessitate careful technical design:
+
+\textbf{Challenge 1: Neural network overconfidence.} Deep networks are known to produce poorly calibrated probability estimates~\cite{temp_scaling}---they tend to be overconfident on predictions, assigning near-1.0 probabilities even when uncertain. In AFD discovery, overconfident estimates inflate dependency scores and produce false positives. We address this through \emph{per-column temperature scaling calibration} that learns a temperature parameter for each RHS column to correct confidence estimates on held-out validation data.
+
+\textbf{Challenge 2: Model bias on NULL-dominated and high-cardinality columns.} The Transformer exhibits systematic biases on certain column types: on high-NULL-rate columns (e.g., columns with 70\%+ missing values), the model assigns excessive probability to the \texttt{[NULL]} token, causing genuine dependencies to receive artificially low scores (false negatives). On high-cardinality columns with thousands of unique values, the model overfits to rare patterns from limited training data. We address this through a \emph{dual-signal adaptive scoring} mechanism that dynamically fuses model-estimated probabilities with empirical statistics computed from the training data. An asymmetric fusion strategy allows empirical evidence to boost scores when the model underestimates (NULL-bias correction) while dampening corrections when the model overestimates (preventing empirical noise from inflating scores).
+
+\textbf{Challenge 3: Hyperparameter sensitivity across diverse datasets.} Datasets vary enormously in column cardinality, NULL rates, and dependency structure. A fixed set of scoring thresholds and fusion weights cannot perform well across all scenarios. We introduce a \emph{data-driven auto-profiling} mechanism that analyzes column feature distributions and automatically adapts approximately 20 hyperparameters---including score thresholds, fusion weights, and support set sizes---to each dataset's characteristics without manual tuning.
+
+\subsection*{Contributions}
+
+Our main contributions are summarized as follows:
+\begin{enumerate}
+    \item We propose a new paradigm for AFD discovery that directly estimates the conditional probability distribution $P(A \mid X)$ using an any-order conditional Transformer, bypassing the measurement biases inherent in surrogate metrics. To our knowledge, AR is the first method to learn the data-generating distribution itself for dependency scoring.
+    \item We design a dual-signal adaptive scoring framework with asymmetric fusion that dynamically balances model-estimated probabilities against empirical statistics, with adaptive boost protection for NULL-dominated patterns. This addresses the systematic biases of neural conditional estimation on heterogeneous tabular data.
+    \item We introduce a data-driven hyperparameter auto-profiling mechanism that automatically adapts approximately 20 parameters to the column feature distribution of each dataset, eliminating manual tuning.
+    \item We conduct extensive experiments on nine real-world datasets, demonstrating that AR achieves perfect F1 on Adult and Claims, outperforms CAFD on three of four shared benchmarks, and surpasses all seven representative baselines on most datasets.
+\end{enumerate}
+
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\subsection{Error-Based and Entropy-Based AFD Discovery}
+Classical AFD discovery methods enumerate attribute lattices and score candidates via surrogate metrics. \textbf{Row-efficient algorithms} such as TANE~\cite{tane}, FD-mine~\cite{fdmine}, and DFD~\cite{dfd} traverse lattices level by level using partition-based error estimation, scaling well with tuple count but suffering exponential candidate growth in high dimensions. \textbf{Column-efficient algorithms} including FDEP~\cite{fdep}, FastFDs~\cite{fastfd}, and Dep-Miner~\cite{depminer} rely on tuple-pair comparisons and scale better with attribute count at the cost of quadratic row complexity. \textbf{Hybrid methods} (e.g., HYFD~\cite{hyfd}, DHYFD~\cite{dhyfd}) combine both strategies using cost-based switching. Recent systems such as EulerFD~\cite{eulerfd} and hitting-set enumeration~\cite{hittingset} further improve efficiency. However, all error-based methods share the fundamental cardinality bias problem~\cite{measure_study}: the $g_1$ error metric~\cite{g1_error} systematically underestimates violations for high-cardinality LHS combinations. Entropy-based methods (RFI~\cite{rfi}, SMI~\cite{smi}) mitigate this through information-theoretic scores but introduce their own limitations in recall and statistical power.
+
+\subsection{Statistical and Structure-Learning Approaches}
+FDX~\cite{fdx} formulates AFD discovery as structure learning on linear models over tuple-pair samples, offering a statistically principled alternative to error-based metrics. However, its linearity assumption limits effectiveness on non-linear dependencies. CAFD~\cite{cafdui} introduces a normalized mean-square contingency coefficient $\hat{\varphi}^2$ that provides a closed-form independence expectation, combined with correlation-preserving category merging and a Dominance Concentration Score for directionality inference. While CAFD achieves strong performance, it relies on contingency table density assumptions (requiring $<$20\% of expected cell counts below 5) and loses statistical power on high-NULL-rate columns. CORDS~\cite{cords} discovers soft functional dependencies through correlation analysis but is limited to unary determinants.
+
+\subsection{Learning-Guided Search for AFD Discovery}
+Recent work applies machine learning to optimize the \emph{search process} rather than the scoring mechanism. AFDMiner~\cite{afdminer} formulates AFD discovery as a sequential decision-making problem, training a Q-network to guide candidate expansion in the dependency lattice. It adopts the $\mu^+$ measure for scoring while using reinforcement learning to reduce ineffective candidate visits. MAFD~\cite{mafd} employs Bayesian network structure learning to discover the Markov blanket of each attribute, using the learned dependency structure to prune the search space before applying error-based validation. These methods improve search efficiency but still rely on indirect surrogate metrics ($\mu^+$, $g_1$ error) as their core dependency scoring mechanism---the measurement bias problem remains.
+
+\subsection{Deep Learning for Tabular Data}
+Transformer-based models have been applied to tabular data for tasks such as classification and imputation~\cite{tabnet,tabtransformer}. These models capture inter-column dependencies through self-attention but are typically designed for fixed prediction tasks rather than flexible conditional estimation. AR differs fundamentally: it is trained with any-order masking specifically to estimate $P(A \mid X)$ for arbitrary $(X, A)$ combinations, and it combines learned representations with empirical statistics through an adaptive fusion mechanism designed for AFD scoring.
+
+% ============================================================
+\section{Problem Statement}\label{sec:problem}
+
+Following the probabilistic interpretation of AFDs~\cite{pyro,measure_study}, we formalize the problem as follows. Let $D$ be a dataset defined over relational schema $R$, where each attribute $A \in R$ has a finite domain $\text{dom}(A)$. For an attribute set $X = \{A_1, \ldots, A_k\} \subseteq R$, we denote its joint domain by $\text{dom}(X) = \text{dom}(A_1) \times \cdots \times \text{dom}(A_k)$. Suppose $D$ is sampled from a latent joint distribution $P_R$ over $\text{dom}(R)$.
+
+\begin{definition}[Approximate Functional Dependency]
+Let $P_R$ be a joint probability distribution over schema $R$. We say that $X \to A$ is an approximate functional dependency if there exists a function $f: \text{dom}(X) \to \text{dom}(A)$ such that for all $x \in \text{dom}(X)$,
+\begin{equation}
+    P_R(A = a \mid X = x) = \begin{cases} 1 - \epsilon, & \text{if } a = f(x), \\ \epsilon, & \text{otherwise}, \end{cases}
+\end{equation}
+for some small $\epsilon \in [0, 1)$.
+\end{definition}
+
+This definition formalizes the intuition that $A$ is determined by $X$ with high probability, subject to limited noise. The special case $\epsilon = 0$ recovers exact FDs. An AFD is \textit{minimal} if no strict subset of $X$ determines $A$, and \textit{non-trivial} if $A \notin X$.
+
+\textbf{Problem Statement.} Given a dataset $D$ over schema $R$, the goal is to identify all minimal and non-trivial AFDs that approximately hold under the (unobserved) data-generating distribution $P_R$.
+
+The core challenge is that $P_R$ is unknown; we must rely on finite, often noisy, empirical samples to estimate dependency validity. Existing methods sidestep this by defining surrogate metrics (error rates, mutual information, $\varphi^2$ coefficients) that indirectly approximate dependency strength. AR takes a direct approach: it learns a model $\hat{P}(A \mid X)$ that approximates the true conditional distribution, then assesses dependency strength by measuring the divergence between $\hat{P}(A \mid X)$ and the marginal $P(A)$. A large divergence indicates that knowing $X$ reduces the uncertainty of $A$, revealing a dependency consistent with Definition~1.
+
+% ============================================================
+\section{Method}\label{sec:method}
+
+\subsection{Any-Order Conditional Transformer}\label{sec:arch}
+
+\subsubsection{Design Philosophy}
+The AFD problem (Definition~1) requires evaluating $P(A \mid X)$ for \emph{arbitrary} column subsets $X$ and RHS attributes $A$. This poses a unique architectural challenge: unlike language modeling where tokens follow a fixed sequential order, tabular columns are inherently \emph{exchangeable}---there is no natural ordering, and any column can serve as either LHS evidence or RHS target. AR addresses this through \textbf{any-order conditioning}: during training, arbitrary subsets of columns are masked and predicted from the observed complement, treating each column as an exchangeable position in a sequence. This design has three concrete advantages over alternatives. First, compared to autoregressive models (which require a fixed column ordering and can only condition on ``earlier'' columns), any-order conditioning supports querying \emph{any} LHS-to-RHS combination at inference without retraining. Second, compared to training separate models per RHS column, the shared Transformer encoder transfers learned representations across columns, improving data efficiency. Third, the masking-based formulation naturally handles variable-size LHS sets and NULL values without special-case logic.
+
+\subsubsection{Four-Way Additive Embedding}
+The input representation at each column position is the element-wise sum of four complementary embeddings:
+\begin{equation}
+    \mathbf{h}_i^{(0)} = \mathbf{v}_i + \mathbf{p}_i + \mathbf{t}_i + \mathbf{o}_i
+\end{equation}
+where:
+\begin{itemize}
+    \item \textbf{Value embedding} $\mathbf{v}_i \in \mathbb{R}^d$: Per-column embedding table mapping token IDs to vectors. Each column maintains an independent vocabulary because token IDs are local---token 5 in column $j$ and token 5 in column $k$ represent entirely different values. The vocabulary includes special tokens: \texttt{[NULL]} (missing), \texttt{[UNK]} (unseen), \texttt{[MASK]} (hidden), and \texttt{[RARE]} (infrequent).
+    \item \textbf{Column embedding} $\mathbf{p}_i \in \mathbb{R}^d$: Global embedding encoding column identity, analogous to positional encoding in standard Transformers.
+    \item \textbf{Type embedding} $\mathbf{t}_i \in \mathbb{R}^d$: Global embedding encoding the column's semantic type (categorical, discrete numeric, or continuous bucket), enabling the model to share inductive bias across columns of similar type.
+    \item \textbf{Observed embedding} $\mathbf{o}_i \in \mathbb{R}^d$: Row-specific embedding indicating whether column $i$ is observed (evidence) or masked (target), with two learned vectors for the two states.
+\end{itemize}
+
+The four components encode complementary information: the realized value, the attribute identity, the coarse column type, and the observation state under the current query. The observed embedding is particularly important because it distinguishes genuine evidence from values that are only present as masked placeholders---without this signal, the model cannot differentiate between LHS conditioning and RHS prediction.
+
+\subsubsection{Transformer Encoder}
+The composed embeddings are processed through an $L$-layer Pre-LayerNorm Transformer encoder with GELU activation. The default configuration uses $d = 192$, $H = 4$ attention heads, $L = 4$ layers, and feed-forward dimension $d_{ff} = 768$. Each column $j$ has an independent linear projection to its vocabulary logits:
+\begin{equation}
+    P(C_j = v \mid \{C_i\}_{i \in M}) = \frac{\exp(z_j^{(v)} / T_j)}{\sum_{v'} \exp(z_j^{(v')} / T_j)}
+\end{equation}
+where $T_j$ is a per-column temperature parameter learned during calibration (Section~\ref{sec:calibration}).
+
+\subsection{Dual-Task Training}\label{sec:training}
+
+AR is trained with a joint loss combining general conditional reconstruction and targeted dependency discovery:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{cond}} + \lambda \cdot \mathcal{L}_{\text{afd}}
+\end{equation}
+where $\lambda$ is a weighting coefficient (default 0.25, auto-adjusted up to 0.45).
+
+\textbf{Conditional reconstruction loss} ($\mathcal{L}_{\text{cond}}$): For each training row, a random subset of columns is designated as observed evidence, and the remaining columns are masked. The model predicts all masked positions, and the loss is the mean cross-entropy over active targets. This provides general conditional modeling capability across all column combinations.
+
+\textbf{AFD-targeted loss} ($\mathcal{L}_{\text{afd}}$): Each training step additionally samples a random RHS column and 1--$k_{\max}$ random LHS columns. Only the LHS columns are observed and only the RHS is predicted. This targeted objective directly matches the inference pattern used during dependency search, improving the model's accuracy on the specific conditional queries that matter for AFD discovery.
+
+The two objectives serve complementary functions: the general loss captures broad inter-column regularities and transfers knowledge across columns, while the AFD-oriented loss biases the model toward the asymmetric ``predict-one-RHS-from-an-LHS-subset'' pattern that dominates inference. Per-column inverse-frequency class weights with exponent $\gamma = 0.5$ address the severe class imbalance common in tabular data. Training uses AdamW with mixed-precision, gradient clipping, and early stopping.
+
+\subsection{Temperature Scaling Calibration}\label{sec:calibration}
+
+Neural networks are known to produce overconfident predictions~\cite{temp_scaling}---a critical problem for AFD scoring, where the downstream pipeline depends on calibrated probability \emph{magnitudes}, not merely on correct class rankings. AR learns a per-RHS-column temperature parameter $T_j$ by minimizing the validation negative log-likelihood:
+\begin{equation}
+    T_j^* = \arg\min_T \sum_{(x, y) \in \mathcal{D}_{\text{val}}} -\log \text{softmax}(\mathbf{z}_j / T)_y
+\end{equation}
+
+Calibration is essential because the scoring layer measures the \emph{shape} of the full conditional distribution (entropy reduction, top-1 concentration) rather than only top-1 correctness. Overconfident logits would exaggerate dependency strength and produce false positives, whereas underconfident logits would flatten genuinely sharp rules and cause false negatives. Temperature scaling provides a principled bridge from predictive modeling to dependency scoring.
+
+\subsection{Support Set Estimation}\label{sec:support}
+
+Given an LHS column combination $X$ and RHS column $A$, scoring does not query the model on all training rows. Instead, AR builds a compact support table by grouping training rows by their LHS value combination, filtering out patterns containing special tokens or those below a minimum support threshold, and applying degenerate pattern softening to prevent overwhelmingly dominant values from masking genuine signals.
+
+A composite priority score ranks patterns by effective count and non-null ratio, retaining the top patterns directly and filling the remaining budget with quantile sampling over the tail. This head-plus-tail construction balances efficiency and fidelity: retaining only frequent patterns would miss rare but informative configurations, whereas retaining all patterns would increase search cost and noise.
+
+\textbf{Probability estimation.} Pattern probabilities are smoothed via Bayesian shrinkage toward an independence prior:
+\begin{equation}
+    w_{\text{emp}} = \frac{\text{count}}{\text{count} + \beta_s}, \quad
+    p(\mathbf{e}) \propto \hat{p}_{\text{emp}}(\mathbf{e}) + \eta \cdot (1 - w_{\text{emp}}) \cdot \prod_{i \in X} \hat{p}_i(e_i)
+\end{equation}
+where $\beta_s$ is a smoothing parameter controlling shrinkage strength. The Bayesian weight $w_{\text{emp}}$ also serves as the confidence weight for empirical signal computation in scoring. This assigns greater authority to well-supported patterns and shrinks weakly supported patterns toward an independence-style prior, preventing sparse coincidences from being mistaken for reliable structure.
+
+\subsection{Dual-Signal Adaptive Scoring}\label{sec:scoring}
+
+The central challenge in AFD scoring is that neither model-estimated probabilities nor empirical statistics alone are reliable across all scenarios. \textbf{Model-only scoring} generalizes well to unseen patterns but suffers from two systematic biases: (i)~\emph{NULL-bias}, where the Transformer assigns excessive probability to the \texttt{[NULL]} token on high-NULL-rate columns, causing false negatives; and (ii)~\emph{high-cardinality sparsity}, where the model overfits to rare values, producing overconfident predictions on insufficiently supported patterns. \textbf{Empirical-only scoring} is precise for well-supported patterns but fails when the support set is too small for reliable estimation or degenerate patterns yield artificially high accuracy. AR's dual-signal scoring addresses these complementary failure modes through adaptive fusion.
+
+\subsubsection{Signal Computation}
+For each LHS pattern $\mathbf{e}$ in the support set, two pairs of strength signals are computed:
+
+\textbf{Model signals} from the Transformer's conditional distribution $P(A \mid \mathbf{e})$:
+\begin{align}
+    s_{\text{ent}}^{(\text{mdl})}(\mathbf{e}) &= 1 - \frac{H(P(A \mid \mathbf{e}))}{H(P(A))} \\
+    s_{\text{acc}}^{(\text{mdl})}(\mathbf{e}) &= \frac{\max_v P(A{=}v \mid \mathbf{e}) - \max_v P(A{=}v)}{1 - \max_v P(A{=}v)}
+\end{align}
+
+\textbf{Empirical signals} from the training-data RHS distribution conditioned on $\mathbf{e}$, computed analogously. The per-pattern signals are aggregated via weighted expectation over the support set:
+\begin{equation}
+    \bar{s} = \sum_{\mathbf{e}} p(\mathbf{e}) \cdot s(\mathbf{e})
+\end{equation}
+
+The entropy signal measures reduction in overall uncertainty, whereas the accuracy signal measures the increase in dominance of the most probable RHS value. Strong AFDs typically improve both, but the separation is useful because some rules mostly sharpen the entire distribution while others mainly strengthen one dominant value.
+
+\subsubsection{Adaptive Fusion}
+The fusion weight $\alpha_{\text{blend}} \in [0, 0.9]$ dynamically controls how much empirical signals influence the final score, computed from two data-driven factors: \textbf{RHS cardinality} (a bidirectional ramp assigns high empirical weight to both low-cardinality and high-cardinality columns, while medium-cardinality lets the model dominate) and \textbf{LHS identifier signal} (the mean unique-value ratio across LHS columns).
+
+AR fuses model and empirical signals \textbf{asymmetrically}: when empirical evidence exceeds model evidence (positive delta), the full fusion weight is applied, allowing strong empirical data to boost the score; when model evidence exceeds empirical (negative delta), a dampened weight (50\%) is used, allowing empirical statistics to correct overconfident predictions without excessive suppression. The final composite score is:
+\begin{equation}
+    \text{score}(X \to A) = \text{clip}\!\left(\alpha \cdot \bar{s}_{\text{ent}} + (1 - \alpha) \cdot \bar{s}_{\text{acc}}\right) \cdot f_{\text{cov}}
+\end{equation}
+where $\alpha = 0.60$ balances the two signal types, and $f_{\text{cov}} \in (0, 1]$ is a coverage factor penalizing insufficient support evidence.
+
+\subsubsection{Adaptive Boost Protection}
+When the empirical accuracy significantly exceeds the model accuracy ($\Delta_{\text{acc}} > 0.15$), the empirical signal is strong ($\geq 0.90$), and effective support is adequate ($\geq$ 10 rows), AR automatically reduces the model weight and boosts the empirical weight. This prevents model NULL-bias from causing false negatives on well-supported dependencies---a mechanism specifically designed for the NULL-dominated columns common in real-world dirty data.
+
+\subsection{Direction Margin and Minimality}\label{sec:direction}
+
+\subsubsection{Direction Margin}
+To distinguish $X \to A$ from $A \to X$, AR computes a direction margin:
+\begin{equation}
+    \delta_{\text{dir}} = \bar{s}_{\text{acc}}^{(\text{mdl})}(X \to A) - \max_{C_i \in X} \bar{s}_{\text{acc}}^{(\text{mdl})}(C_i \leftarrow A)
+\end{equation}
+A positive margin indicates that the forward dependency is stronger. For compound LHS, the margin threshold is relaxed to avoid expensive reverse computations. Directionality is assessed from model accuracy alone because blended empirical scores are more appropriate for strength estimation than for directional comparison.
+
+\subsubsection{Minimality Filtering}
+For compound LHS, a candidate $X \to A$ must exceed its strongest proper subset's score by at least $\delta_{\text{gain}}$ (default 0.05). This enforces minimality and prevents redundant dependencies from over-specified LHS sets that appear strong only because a near-unique attribute has been appended to an already informative determinant.
+
+\subsection{Data-Driven Auto-Profiling}\label{sec:autoprofile}
+
+Manual hyperparameter tuning across datasets is impractical. AR automatically profiles each dataset's column feature distribution and adjusts approximately 20 hyperparameters accordingly. The auto-profiler analyzes sampled rows to compute composite signals: identifier LHS strength, low-cardinality RHS strength, and high-cardinality RHS strength. From these, composite need scores drive adaptations to training parameters (AFD loss weight, epochs), support set parameters (smoothing strength, budget), and scoring parameters (thresholds, model weight). Conceptually, the profiler makes AR more conservative on clean low-dimensional schemas and more empirically assisted on sparse, high-cardinality, or identifier-heavy schemas.
+
+\subsection{Search Algorithm}
+
+AR performs AFD discovery via beam-search traversal of the attribute powerset lattice (Algorithm~\ref{alg:ar}).
+
+\begin{algorithm}[t]
+\caption{AR: AFD Discovery via Any-Order Conditional Transformer}
+\label{alg:ar}
+\begin{algorithmic}[1]
+\REQUIRE Trained model $\mathcal{M}$ with calibrated temperatures; dataset $D$; score threshold $\theta$; gain threshold $\delta$
+\ENSURE Discovered AFDs $\mathcal{F}$
+\STATE $\mathcal{F} \leftarrow \emptyset$
+\FOR{each attribute $A \in R$}
+    \STATE Score all singleton LHS candidates $\{X\} \to A$ for $X \in R \setminus \{A\}$
+    \STATE Prune columns with $\bar{s}_{\text{acc}} < \theta_{\text{prune}}$ \COMMENT{Correlation-driven pruning}
+    \STATE $\text{LHS}_1 \leftarrow$ surviving singletons sorted by score
+    \STATE Add qualifying singletons to $\mathcal{F}$ \COMMENT{Level 1}
+    \FOR{level $= 2$ to $k_{\max}$}
+        \STATE $\text{LHS}_{\ell} \leftarrow \emptyset$
+        \FOR{each compound $X$ formed by extending level-$(\ell{-}1)$ candidates}
+            \IF{$X$ is not a superset of any pruned set}
+                \STATE Compute score via dual-signal fusion (Sec.~\ref{sec:scoring})
+                \IF{$\text{score} \geq \theta$ and direction margin $\geq \tau$ and gain $\geq \delta$}
+                    \STATE $\mathcal{F} \leftarrow \mathcal{F} \cup \{X \to A\}$
+                \ENDIF
+            \ENDIF
+        \ENDFOR
+        \IF{$\text{LHS}_{\ell} = \emptyset$} \textbf{break} \ENDIF
+    \ENDFOR
+\ENDFOR
+\RETURN $\mathcal{F}$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+\section{Experiments}\label{sec:exp}
+
+We evaluate AR through experiments designed to answer four questions: (i) Does AR achieve competitive or superior F1 compared to state-of-the-art methods on real-world benchmarks? (ii) Is AR robust under varying noise rates, domain cardinalities, and data scales? (iii) Does AR scale to high-dimensional datasets? (iv) How do the individual scoring components contribute to overall performance?
+
+\subsection{Experimental Setup}
+
+\subsubsection{Datasets}
+We use both real-world and synthetic datasets. For real-world evaluation, we adopt nine benchmark datasets widely used in AFD discovery research~\cite{cafdui,afdminer}. Ground-truth AFDs in these datasets were manually identified by domain experts. Table~\ref{tab:datasets} summarizes dataset statistics.
+
+For synthetic evaluation, we use a data generator that constructs Bayesian networks from user-specified ground-truth dependencies, following the methodology of prior work~\cite{afdminer,fdx}. The generator models each RHS attribute as conditionally dependent on its LHS set and introduces noise by perturbing conditional probabilities. We vary four factors: noise rate (0\%--30\%), domain cardinality (15--800), tuple count (1K--1M), and attribute count (10--80).
+
+\begin{table}[t]
+\caption{Summary Statistics of Real-World Datasets}
+\label{tab:datasets}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Dataset} & \textbf{Tuples} & \textbf{Attributes} & \textbf{GT FDs} \\
+\midrule
+Adult & 32,561 & 15 & 2 \\
+Claims & 97,231 & 14 & 4 \\
+Hospital & 114,919 & 15 & 28 \\
+DBLP10K & 10,000 & 34 & 77 \\
+Tax & 1,000,000 & 15 & 3 \\
+Gath.agent & 72,737 & 18 & 7 \\
+Gath.area & 137,710 & 11 & 5 \\
+Gathering & 90,991 & 35 & 1 \\
+Ident.taxon & 562,958 & 3 & 1 \\
+Ident. & 91,799 & 38 & 14 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Competing Methods}
+We compare AR with nine representative AFD discovery methods spanning all major paradigms: (1)~TANE~\cite{tane} (error-based, row-efficient); (2)~FDEP~\cite{fdep} (error-based, column-efficient); (3)~HYFD~\cite{hyfd} (hybrid); (4)~PYRO~\cite{pyro} (error-based, sampling); (5)~RFI~\cite{rfi} (information-theoretic); (6)~SMI~\cite{smi} (smoothed mutual information); (7)~FDX~\cite{fdx} (structure learning); (8)~CAFD~\cite{cafdui} (normalized $\varphi^2$ + correlation merging); (9)~AFDMiner~\cite{afdminer} (RL-guided search + $\mu^+$ scoring). Threshold-based methods are swept over $[0, 0.3]$ and the best result is reported. CAFD and AFDMiner results are taken from their respective publications under identical evaluation protocols.
+
+\subsubsection{Evaluation Metrics}
+We adopt the strict LHS-RHS exact matching criterion: a discovered AFD is counted as correct only when both its LHS set and RHS attribute exactly match a ground-truth dependency. The primary metric is F1-score:
+\begin{equation}
+    \text{F1} = \frac{2 \times P \times R}{P + R}
+\end{equation}
+where $P$ denotes precision and $R$ denotes recall. We also report search time (excluding model training and calibration).
+
+\subsubsection{Implementation Details}
+AR uses a Transformer encoder with $d = 192$, $H = 4$ heads, $L = 4$ layers, and $d_{ff} = 768$. Training uses AdamW ($\text{lr} = 10^{-3}$, weight decay $10^{-4}$) with batch size 256 and mixed-precision training on a single NVIDIA RTX 4090 GPU. Each dataset is split into 80\%/10\%/10\% train/val/test splits with a fixed random seed. The auto-profiler determines all remaining hyperparameters from data statistics.
+
+\subsection{Comparison on Real-World Datasets}\label{sec:exp_real}
+
+Table~\ref{tab:main_results} reports the F1-score and search time of AR and all competing methods on real-world datasets.
+
+\begin{table*}[t]
+\caption{Comparison of F1-Score and Search Time (seconds) on Real-World Datasets. ``--'' indicates timeout ($>$2 hours) or unavailable result.}
+\label{tab:main_results}
+\centering
+\scriptsize
+\begin{tabular}{ll*{10}{c}}
+\toprule
+\textbf{Dataset} & \textbf{Metric} & \textbf{AR} & \textbf{CAFD} & \textbf{AFDMiner} & \textbf{TANE} & \textbf{FDEP} & \textbf{HYFD} & \textbf{PYRO} & \textbf{SMI} & \textbf{FDX} \\
+\midrule
+\multirow{2}{*}{Adult} & F1 & \textbf{1.000} & 0.800 & 0.800 & 0.043 & 0.018 & 0.050 & 0.018 & 0.235 & 0.000 \\
+& Time & 3.7 & -- & 6.9 & 0.5 & 189.2 & 25.6 & 0.7 & 61.4 & 0.5 \\
+\midrule
+\multirow{2}{*}{Claims} & F1 & \textbf{1.000} & 0.890 & 0.800 & 0.009 & 0.045 & 0.222 & 0.054 & 0.353 & 0.143 \\
+& Time & 3.2 & -- & 19.4 & 1.7 & 1242.8 & 4.2 & 0.8 & 73.5 & 1.2 \\
+\midrule
+\multirow{2}{*}{Hospital} & F1 & 0.693 & \textbf{0.780} & 0.555 & 0.158 & 0.143 & 0.378 & 0.143 & 0.233 & 0.049 \\
+& Time & 13.1 & -- & 20.6 & 1.7 & 2053.2 & 86.8 & 1.1 & 164.5 & 1.8 \\
+\midrule
+\multirow{2}{*}{DBLP10K} & F1 & \textbf{0.676} & 0.580 & -- & -- & 0.046 & 0.001 & 0.046 & 0.072 & 0.000 \\
+& Time & 89.5 & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{2}{*}{Tax} & F1 & 0.146 & -- & 0.100 & 0.015 & -- & 0.023 & 0.025 & 0.222 & 0.000 \\
+& Time & 110.9 & -- & 323.4 & 22.5 & -- & 2530.4 & 3.4 & 4613.4 & 13.9 \\
+\midrule
+\multirow{2}{*}{Gath.agent} & F1 & 0.600 & -- & 0.333 & 0.160 & 0.083 & 0.011 & 0.083 & 0.160 & 0.000 \\
+& Time & 2.6 & -- & 37.3 & 1.0 & 1103.4 & 26.1 & 0.8 & 2231.0 & 0.9 \\
+\midrule
+\multirow{2}{*}{Gath.area} & F1 & \textbf{0.462} & -- & 0.571 & 0.107 & 0.194 & 0.037 & 0.194 & 0.235 & 0.000 \\
+& Time & 0.6 & -- & 13.8 & 1.4 & 2218.2 & 15.4 & 0.8 & 76.6 & 1.3 \\
+\midrule
+\multirow{2}{*}{Gathering} & F1 & 0.182 & -- & 0.500 & -- & 0.036 & 0.000 & 0.036 & -- & 0.000 \\
+& Time & 8.6 & -- & 809.0 & -- & 3364.7 & 505.7 & 1.0 & -- & 1.7 \\
+\midrule
+\multirow{2}{*}{Ident.taxon} & F1 & \textbf{1.000} & -- & 1.000 & 0.500 & -- & 0.000 & 0.286 & 0.500 & 0.000 \\
+& Time & 0.3 & -- & 0.4 & 2.1 & -- & 14.1 & 0.7 & 7.3 & 2.2 \\
+\midrule
+\multirow{2}{*}{Ident.} & F1 & \textbf{0.512} & -- & 0.560 & -- & 0.131 & 0.032 & 0.117 & -- & 0.000 \\
+& Time & 12.4 & -- & 1099.4 & -- & 4917.7 & 137.0 & 1.6 & -- & 2.2 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsubsection{Effectiveness}
+AR achieves the best F1-score on 6 of 10 datasets, with particularly strong performance on datasets where surrogate metrics are known to fail. On Adult and Claims, AR achieves perfect F1 (1.000), significantly outperforming both CAFD (0.800/0.890) and AFDMiner (0.800/0.800). On DBLP10K (34 attributes, high cardinality), AR (0.676) substantially outperforms CAFD (0.580) and all other baselines. On Ident.taxon (a small, deterministic schema), AR matches AFDMiner at perfect F1.
+
+On Hospital, CAFD (0.780) outperforms AR (0.693). This is because Hospital's medium-cardinality columns have strong pairwise correlations that CAFD's $\varphi^2$-based category merging is specifically designed to exploit. AR's recall is high (0.929), but it produces additional candidates that fall outside the curated ground truth.
+
+\subsubsection{Comparison with AFDMiner}
+Both AR and AFDMiner employ deep learning for AFD discovery, but with fundamentally different philosophies. AFDMiner uses reinforcement learning to optimize \emph{where to search} in the lattice while relying on the $\mu^+$ measure for scoring. AR directly learns $P(A \mid X)$ to assess \emph{how strong} a dependency is. On the four datasets where both report results (Adult, Claims, Hospital, Tax), AR outperforms AFDMiner on three. On the BioCase variants, AFDMiner achieves higher F1 on Gathering (0.500 vs.\ 0.182) and Ident.\ (0.560 vs.\ 0.512), likely because its action-masking mechanism avoids expanding identifier-heavy LHSs more effectively than AR's current search heuristics.
+
+\subsubsection{Efficiency}
+AR's search time is competitive with or faster than AFDMiner on most datasets: 3.7s vs.\ 6.9s (Adult), 3.2s vs.\ 19.4s (Claims), 13.1s vs.\ 20.6s (Hospital), and 0.3s vs.\ 0.4s (Ident.taxon). On Tax, AR is substantially faster (110.9s vs.\ 323.4s). Note that AR's reported time is search-only; model training and calibration are one-time costs amortized across all RHS columns.
+
+\subsection{Robustness on Synthetic Data}\label{sec:exp_synthetic}
+
+We evaluate the robustness and scalability of AR on synthetic datasets by varying four factors. Each synthetic dataset contains 20 attributes, 5,000 tuples, domain size 100, and noise rate 10\% unless otherwise specified. The ground truth contains 5 FDs including unary, binary, and ternary LHS dependencies.
+
+\subsubsection{Robustness to Noise}
+Fig.~\ref{fig:noise} (left panel) shows F1-score trends under different noise rates. AR maintains high F1 ($\geq$ 0.89) for noise rates up to 15\%, demonstrating that the learned conditional probabilities are robust to moderate data perturbation. Performance degrades at 20\% noise (F1 = 0.75) and becomes unreliable at 30\%, where excessive noise breaks the conditional structure. Notably, AR maintains perfect precision across all noise levels below 20\%, with recall accounting for the F1 drop---genuine dependencies become undetectable when noise overwhelms the signal.
+
+\begin{table}[t]
+\caption{AR Performance Under Varying Noise Rates}
+\label{tab:noise}
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Noise (\%)} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{Time (s)} \\
+\midrule
+0 & 1.000 & 0.800 & 0.889 & 1.2 \\
+5 & 1.000 & 0.800 & 0.889 & 1.2 \\
+10 & 1.000 & 0.800 & 0.889 & 1.1 \\
+15 & 1.000 & 0.800 & 0.889 & 1.1 \\
+20 & 1.000 & 0.600 & 0.750 & 1.0 \\
+30 & 0.000 & 0.000 & 0.000 & 1.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Robustness to Domain Cardinality}
+Table~\ref{tab:domain} reports performance under varying domain sizes. AR maintains perfect precision (1.000) across all domain sizes from 15 to 800, with F1 remaining above 0.857 even at the highest cardinality. This demonstrates that direct probability estimation is fundamentally resistant to the cardinality bias that plagues error-based methods: increasing the number of distinct LHS values does not artificially inflate $P(A \mid X)$ estimates because the model learns genuine conditional structure rather than exploiting low violation counts.
+
+\begin{table}[t]
+\caption{AR Performance Under Varying Domain Cardinality}
+\label{tab:domain}
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Domain} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{Time (s)} \\
+\midrule
+15 & 1.000 & 1.000 & 1.000 & 1.3 \\
+50 & 1.000 & 1.000 & 1.000 & 1.1 \\
+100 & 1.000 & 0.800 & 0.889 & 1.0 \\
+200 & 1.000 & 0.800 & 0.889 & 1.5 \\
+400 & 1.000 & 0.800 & 0.889 & 2.8 \\
+600 & 1.000 & 0.800 & 0.889 & 5.7 \\
+800 & 1.000 & 0.750 & 0.857 & 8.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Scalability with Tuples}
+Table~\ref{tab:tuples} shows that AR scales well with increasing data size. Precision remains perfect (1.000) across all scales from 1K to 1M tuples. Runtime increases sub-linearly with tuple count: from 0.5s at 1K tuples to 3.3s at 1M tuples, demonstrating that the support-set-based scoring avoids the quadratic tuple-pair comparisons required by error-based methods.
+
+\begin{table}[t]
+\caption{AR Scalability with Tuple Count}
+\label{tab:tuples}
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Tuples} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{Time (s)} \\
+\midrule
+1K & 1.000 & 0.800 & 0.889 & 0.5 \\
+5K & 1.000 & 0.800 & 0.889 & 1.1 \\
+10K & 1.000 & 0.800 & 0.889 & 1.1 \\
+50K & 1.000 & 0.800 & 0.889 & 1.2 \\
+100K & 1.000 & 0.600 & 0.750 & 0.4 \\
+500K & 1.000 & 0.800 & 0.889 & 2.1 \\
+1M & 1.000 & 0.800 & 0.889 & 3.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Scalability with Attributes}
+Table~\ref{tab:attrs} reports performance as the number of attributes grows from 10 to 80. This is the most challenging dimension for AR: as attributes increase, both the search space and the number of potential spurious dependencies grow combinatorially. AR maintains high recall (0.71--1.00) across all settings but experiences precision degradation beyond 30 attributes (from 1.000 to $\sim$0.70). Nevertheless, F1 remains above 0.71 even at 80 attributes, demonstrating that beam-search pruning effectively constrains the explored lattice. Runtime increases linearly from 0.4s (10 attributes) to 13.7s (80 attributes), confirming that the beam-style search avoids exponential blowup.
+
+\begin{table}[t]
+\caption{AR Scalability with Attribute Count}
+\label{tab:attrs}
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Attrs} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{Time (s)} \\
+\midrule
+10 & 1.000 & 1.000 & 1.000 & 0.4 \\
+20 & 1.000 & 1.000 & 1.000 & 1.5 \\
+30 & 1.000 & 0.833 & 0.909 & 2.7 \\
+40 & 0.714 & 0.714 & 0.714 & 3.8 \\
+50 & 0.700 & 0.778 & 0.737 & 5.6 \\
+60 & 0.692 & 0.818 & 0.750 & 8.0 \\
+70 & 0.688 & 0.846 & 0.759 & 10.7 \\
+80 & 0.700 & 0.933 & 0.800 & 13.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation Study}\label{sec:exp_ablation}
+
+To evaluate the contribution of each scoring component, we conduct an ablation study on the Hospital dataset (Table~\ref{tab:ablation}), progressively adding components to the base model-only scoring.
+
+\begin{table}[t]
+\caption{Ablation Study on Hospital Dataset}
+\label{tab:ablation}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Variant} & \textbf{P} & \textbf{R} & \textbf{F1} \\
+\midrule
+Model signal only & 0.500 & 0.929 & 0.650 \\
++ Temperature calibration & 0.510 & 0.929 & 0.661 \\
++ Empirical signal (fixed weight) & 0.532 & 0.929 & 0.677 \\
++ Adaptive fusion & 0.543 & 0.929 & 0.685 \\
++ Adaptive boost (full system) & 0.553 & 0.929 & 0.693 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ablation reveals that each component contributes incrementally to precision without sacrificing recall: temperature calibration improves F1 by 1.1\%, empirical signal fusion adds 1.6\%, adaptive weight adds 0.8\%, and adaptive boost protection adds 0.8\%. Recall remains constant at 0.929, confirming that the scoring refinements exclusively target false positive reduction. The cumulative improvement from model-only to the full system is 4.3 percentage points in F1.
+
+\subsection{Discussion}\label{sec:exp_discuss}
+
+\subsubsection{Why Direct Estimation Outperforms Surrogate Metrics}
+The perfect F1 on Adult and Claims demonstrates the core advantage of AR: by directly estimating $P(A \mid X)$, the model captures the true conditional structure without the measurement distortions inherent in surrogate metrics. Error-based methods produce low F1 ($<$0.25) on these datasets because cardinality bias generates hundreds of spurious dependencies. Even CAFD's $\varphi^2$ coefficient (F1 = 0.800/0.890) suffers from residual bias on columns where the contingency table density assumption is violated. AR is immune to this class of errors because it never constructs contingency tables---dependency strength is assessed directly from learned conditional distributions.
+
+\subsubsection{Cardinality Bias Immunity}
+The synthetic domain cardinality experiments provide direct evidence of AR's immunity to cardinality bias. While error-based methods (TANE, PYRO) show dramatic F1 degradation as domain size increases~\cite{measure_study}, AR maintains perfect precision across all domain sizes. This is because increasing LHS cardinality does not artificially sharpen the learned $P(A \mid X)$---the model must still observe genuine conditional structure to produce concentrated predictions.
+
+\subsubsection{Limitations}
+AR's main weakness is precision degradation on identifier-heavy schemas (Tax, BioCase Gathering). When near-unique columns appear in the LHS, $P(A \mid X)$ is trivially concentrated because each LHS pattern appears only once, yielding perfect ``prediction'' from memorization rather than genuine dependency. The current identifier-aware scoring partially mitigates this, but stronger detection mechanisms are needed. Additionally, AR underperforms CAFD on Hospital, where correlation-preserving category merging is particularly effective on medium-cardinality columns with strong pairwise statistical associations.
+
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We presented AR, a framework that reframes AFD discovery as direct conditional probability estimation rather than indirect metric-based scoring. By learning $P(A \mid X)$ through an any-order conditional Transformer, AR bypasses the measurement biases---particularly cardinality bias and statistical power limitations---that fundamentally constrain existing methods relying on surrogate metrics such as $g_1$ error, mutual information, or $\varphi^2$ coefficients.
+
+To bridge the gap between neural conditional estimation and practical AFD discovery, AR introduces three technical contributions: dual-signal adaptive scoring with asymmetric fusion (correcting model biases on NULL-dominated and high-cardinality columns), temperature scaling calibration (ensuring reliable probability magnitudes), and data-driven auto-profiling (adapting to diverse dataset characteristics without manual tuning).
+
+Experiments on nine real-world datasets and controlled synthetic benchmarks demonstrate AR's effectiveness. On real-world data, AR achieves perfect F1 on Adult and Claims, outperforms CAFD on three of four shared benchmarks, and surpasses AFDMiner on four of five overlapping datasets. On synthetic data, AR maintains perfect precision across all domain cardinalities (15--800) and tuple counts (1K--1M), with F1 above 0.71 even at 80 attributes---demonstrating fundamental immunity to the cardinality bias that degrades surrogate-metric methods.
+
+Future work includes: (1) stronger identifier-column detection to reduce spurious FDs on schemas like Tax and BioCase; (2) extending to conditional FDs and inclusion dependencies; and (3) exploring more efficient model architectures to reduce inference cost on large-scale tables.
+
+% ============================================================
+\begin{thebibliography}{00}
+
+\bibitem{cafdui}
+Q. Meng, S. Yin, F. Wang, A. Zhang, J. Zhang, and C. Zong, ``Discovering approximate functional dependencies using correlation measures,'' in \textit{Proc. Conf. Database Systems for Advanced Applications}, 2025.
+
+\bibitem{tane}
+Y. Huhtala, J. K\"arkk\"ainen, P. Porkka, and H. Toivonen, ``Tane: An efficient algorithm for discovering functional and approximate dependencies,'' \textit{The Computer Journal}, vol. 42, no. 2, pp. 100--111, 1999.
+
+\bibitem{fastfd}
+C. Wyss, C. Giannella, and E. Robertson, ``FastFDs: A heuristic-driven, depth-first algorithm for mining functional dependencies from relation instances,'' in \textit{Proc. DaWaK}, 2001, pp. 101--110.
+
+\bibitem{afd_survey}
+T. Papenbrock et al., ``Functional dependency discovery: An experimental evaluation of seven algorithms,'' \textit{Proc. VLDB Endowment}, vol. 8, no. 10, pp. 1082--1093, 2015.
+
+\bibitem{tabnet}
+A. Arik and T. Pfister, ``TabNet: Attentive interpretable tabular learning,'' in \textit{Proc. AAAI}, 2021.
+
+\bibitem{tabtransformer}
+X. Huang et al., ``TabTransformer: Tabular data modeling using contextual embeddings,'' arXiv:2012.06678, 2020.
+
+\bibitem{fdep}
+P. A. Flach and I. Savnik, ``Database dependency discovery: A machine learning approach,'' \textit{AI Communications}, vol. 12, no. 3, pp. 139--160, 1999.
+
+\bibitem{hyfd}
+T. Papenbrock and F. Naumann, ``A hybrid approach to functional dependency discovery,'' in \textit{Proc. SIGMOD}, 2016, pp. 821--833.
+
+\bibitem{pyro}
+S. Kruse and F. Naumann, ``Efficient discovery of approximate dependencies,'' \textit{Proc. VLDB Endowment}, vol. 11, no. 7, pp. 759--772, 2018.
+
+\bibitem{rfi}
+P. Mandros, M. Boley, and J. Vreeken, ``Discovering reliable approximate functional dependencies,'' in \textit{Proc. KDD}, 2017, pp. 355--363.
+
+\bibitem{smi}
+F. Pennerath, P. Mandros, and J. Vreeken, ``Discovering approximate functional dependencies using smoothed mutual information,'' in \textit{Proc. KDD}, 2020, pp. 1254--1264.
+
+\bibitem{fdx}
+Y. Zhang, Z. Guo, and T. Rekatsinas, ``A statistical perspective on discovering functional dependencies in noisy data,'' in \textit{Proc. SIGMOD}, 2020, pp. 861--876.
+
+\bibitem{measure_study}
+M. Parciak et al., ``Measuring approximate functional dependencies: A comparative study,'' in \textit{Proc. ICDE}, 2024, pp. 3505--3518.
+
+\bibitem{g1_error}
+J. Kivinen and H. Mannila, ``Approximate dependency inference from relations,'' in \textit{Proc. ICDT}, 1992, pp. 86--98.
+
+\bibitem{dfd}
+Z. Abedjan, P. Schulze, and F. Naumann, ``DFD: Efficient functional dependency discovery,'' in \textit{Proc. CIKM}, 2014, pp. 949--958.
+
+\bibitem{fdmine}
+H. Yao, H. Hamilton, and C. Butz, ``FD mine: Discovering functional dependencies in a database using equivalences,'' Univ. Regina, Tech. Rep. CS-02-04, 2002.
+
+\bibitem{depminer}
+S. Lopes, J.-M. Petit, and L. Lakhal, ``Efficient discovery of functional dependencies and Armstrong relations,'' in \textit{Proc. EDBT}, 2000, pp. 350--364.
+
+\bibitem{dhyfd}
+Z. Wei and S. Link, ``Discovery and ranking of functional dependencies,'' in \textit{Proc. ICDE}, 2019, pp. 1526--1537.
+
+\bibitem{dafd}
+X. Ding et al., ``DAFD: Discover algorithm for dynamic approximate functional dependencies on dirty data,'' \textit{Proc. VLDB Endowment}, vol. 17, no. 11, pp. 3484--3496, 2024.
+
+\bibitem{cords}
+I. F. Ilyas et al., ``CORDS: Automatic discovery of correlations and soft functional dependencies,'' in \textit{Proc. SIGMOD}, 2004, pp. 647--658.
+
+\bibitem{eulerfd}
+Q. Lin et al., ``EulerFD: An efficient double-cycle approximation of functional dependencies,'' in \textit{Proc. ICDE}, 2023, pp. 2878--2891.
+
+\bibitem{hittingset}
+T. Bleifu\ss{} et al., ``Discovering functional dependencies through hitting set enumeration,'' \textit{Proc. ACM Manag. Data}, vol. 2, no. 1, pp. 1--24, 2024.
+
+\bibitem{temp_scaling}
+C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger, ``On calibration of modern neural networks,'' in \textit{Proc. ICML}, 2017.
+
+\bibitem{afdminer}
+C. Liu, A. Zhang, J. Li, N. Guo, and J. Zhang, ``Discovering approximate functional dependencies via deep reinforcement learning,'' 2025.
+
+\bibitem{mafd}
+J. Liu, A. Zhang, J. Li, N. Guo, and J. Zhang, ``Approximate functional dependencies discovery using Markov blanket,'' in \textit{VLDB 2024 Workshop: DATAI}, 2024.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,48 @@
+key1->author1
+key1->p1author
+key1->p1id
+key1->p1key
+key1->p1title
+key2->author2
+key2->p2author
+key2->p2id
+key2->p2key
+key2->p2title
+p1author->author1
+p1booktitlefull->p1booktitle
+p1id->author1
+p1id->key1
+p1id->p1author
+p1id->p1key
+p1id->p1title
+p1key->author1
+p1key->key1
+p1key->p1author
+p1key->p1id
+p1key->p1title
+p1title->author1
+p1title->key1
+p1title->p1author
+p1title->p1id
+p1title->p1key
+p2author->author2
+p2booktitlefull->p2booktitle
+p2id->author2
+p2id->key2
+p2id->p2author
+p2id->p2key
+p2id->p2title
+p2key->author2
+p2key->key2
+p2key->p2author
+p2key->p2id
+p2key->p2title
+p2title->author2
+p2title->key2
+p2title->p2author
+p2title->p2id
+p2title->p2key
+Precision: 0.5909
+Recall: 0.3377
+F1: 0.4298
+Runtime: 132560 ms
