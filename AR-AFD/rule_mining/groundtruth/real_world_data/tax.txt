@@ -1,3 +1,0 @@
-AreaCode->State
-Zip->City
-Zip->State

@@ -1,5 +1,0 @@
-AreaName->AreaClass
-AreaName->AreaCode
-AreaCode->AreaName
-AreaCode->AreaClass
-_unitguid->_datasetguid
